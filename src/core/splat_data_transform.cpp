@@ -3,19 +3,250 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/splat_data_transform.hpp"
+#include "core/cuda/sh_layout.cuh"
 #include "core/logger.hpp"
 #include "core/point_cloud.hpp"
 #include "core/splat_data.hpp"
 #include "geometry/bounding_box.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
+#include <limits>
 #include <numeric>
+#include <optional>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 namespace lfs::core {
+
+    namespace {
+
+        constexpr double SH_C1 = 0.48860251190291987;
+        constexpr double SH_C2_0 = 1.0925484305920792;
+        constexpr double SH_C2_1 = 0.94617469575755997;
+        constexpr double SH_C2_2 = 0.31539156525251999;
+        constexpr double SH_C2_3 = 0.54627421529603959;
+
+        constexpr double SH_C3_0 = 0.59004358992664352;
+        constexpr double SH_C3_1 = 2.8906114426405538;
+        constexpr double SH_C3_2 = 0.45704579946446572;
+        constexpr double SH_C3_3 = 0.3731763325901154;
+        constexpr double SH_C3_4 = 1.4453057213202769;
+
+        constexpr double SH_SOLVE_EPS = 1e-12;
+        constexpr float ROTATION_EPS = 1e-6f;
+        constexpr int SH_FIT_SAMPLE_COUNT = 96;
+
+        [[nodiscard]] bool has_significant_rotation(const glm::quat& q) {
+            return std::abs(std::abs(q.w) - 1.0f) > ROTATION_EPS ||
+                   std::abs(q.x) > ROTATION_EPS ||
+                   std::abs(q.y) > ROTATION_EPS ||
+                   std::abs(q.z) > ROTATION_EPS;
+        }
+
+        [[nodiscard]] int sh_band_offset_in_rest(const int band) {
+            // shN omits l=0, so l=1 starts at 0, l=2 at 3, l=3 at 8...
+            return band * band - 1;
+        }
+
+        [[nodiscard]] std::vector<glm::dvec3> fibonacci_sphere_dirs(const int count) {
+            std::vector<glm::dvec3> dirs;
+            dirs.reserve(static_cast<size_t>(count));
+            constexpr double GOLDEN_ANGLE = 2.39996322972865332;
+            for (int i = 0; i < count; ++i) {
+                const double t = (static_cast<double>(i) + 0.5) / static_cast<double>(count);
+                const double y = 1.0 - 2.0 * t;
+                const double r = std::sqrt(std::max(0.0, 1.0 - y * y));
+                const double theta = GOLDEN_ANGLE * static_cast<double>(i);
+                const double x = std::cos(theta) * r;
+                const double z = std::sin(theta) * r;
+                dirs.emplace_back(x, y, z);
+            }
+            return dirs;
+        }
+
+        [[nodiscard]] std::vector<double> eval_sh_band_basis(const int band, const glm::dvec3& dir) {
+            const double x = dir.x;
+            const double y = dir.y;
+            const double z = dir.z;
+            const double xx = x * x;
+            const double yy = y * y;
+            const double zz = z * z;
+
+            switch (band) {
+            case 1:
+                return {-SH_C1 * y, SH_C1 * z, -SH_C1 * x};
+            case 2:
+                return {
+                    SH_C2_0 * x * y,
+                    -SH_C2_0 * y * z,
+                    SH_C2_1 * zz - SH_C2_2,
+                    -SH_C2_0 * x * z,
+                    SH_C2_3 * (xx - yy)};
+            case 3:
+                return {
+                    SH_C3_0 * y * (-3.0 * xx + yy),
+                    SH_C3_1 * x * y * z,
+                    SH_C3_2 * y * (1.0 - 5.0 * zz),
+                    SH_C3_3 * z * (5.0 * zz - 3.0),
+                    SH_C3_2 * x * (1.0 - 5.0 * zz),
+                    SH_C3_4 * z * (xx - yy),
+                    SH_C3_0 * x * (-xx + 3.0 * yy)};
+            default:
+                return {};
+            }
+        }
+
+        [[nodiscard]] bool solve_linear_system(std::vector<double> a, std::vector<double>& b, const int n, const int rhs_cols) {
+            for (int col = 0; col < n; ++col) {
+                int pivot_row = col;
+                double pivot_abs = std::abs(a[col * n + col]);
+                for (int row = col + 1; row < n; ++row) {
+                    const double candidate = std::abs(a[row * n + col]);
+                    if (candidate > pivot_abs) {
+                        pivot_abs = candidate;
+                        pivot_row = row;
+                    }
+                }
+                if (pivot_abs < SH_SOLVE_EPS) {
+                    return false;
+                }
+
+                if (pivot_row != col) {
+                    for (int k = 0; k < n; ++k) {
+                        std::swap(a[col * n + k], a[pivot_row * n + k]);
+                    }
+                    for (int k = 0; k < rhs_cols; ++k) {
+                        std::swap(b[col * rhs_cols + k], b[pivot_row * rhs_cols + k]);
+                    }
+                }
+
+                const double pivot = a[col * n + col];
+                for (int k = col; k < n; ++k) {
+                    a[col * n + k] /= pivot;
+                }
+                for (int k = 0; k < rhs_cols; ++k) {
+                    b[col * rhs_cols + k] /= pivot;
+                }
+
+                for (int row = 0; row < n; ++row) {
+                    if (row == col) {
+                        continue;
+                    }
+                    const double factor = a[row * n + col];
+                    if (std::abs(factor) < SH_SOLVE_EPS) {
+                        continue;
+                    }
+                    for (int k = col; k < n; ++k) {
+                        a[row * n + k] -= factor * a[col * n + k];
+                    }
+                    for (int k = 0; k < rhs_cols; ++k) {
+                        b[row * rhs_cols + k] -= factor * b[col * rhs_cols + k];
+                    }
+                }
+            }
+            return true;
+        }
+
+        [[nodiscard]] std::optional<std::vector<float>> compute_sh_coeff_rotation_matrix(
+            const glm::mat3& rotation_local_to_world,
+            const int band) {
+            if (band < 1 || band > 3) {
+                return std::nullopt;
+            }
+
+            const int basis_count = 2 * band + 1;
+            const auto sample_dirs = fibonacci_sphere_dirs(SH_FIT_SAMPLE_COUNT);
+
+            const glm::dmat3 rot(rotation_local_to_world);
+            const glm::dmat3 rot_inv = glm::inverse(rot);
+
+            std::vector<double> wtw(static_cast<size_t>(basis_count * basis_count), 0.0);
+            std::vector<double> wtl(static_cast<size_t>(basis_count * basis_count), 0.0);
+
+            for (const auto& world_dir : sample_dirs) {
+                const glm::dvec3 local_dir = glm::normalize(rot_inv * world_dir);
+                const std::vector<double> basis_world = eval_sh_band_basis(band, world_dir);
+                const std::vector<double> basis_local = eval_sh_band_basis(band, local_dir);
+
+                for (int r = 0; r < basis_count; ++r) {
+                    for (int c = 0; c < basis_count; ++c) {
+                        wtw[r * basis_count + c] += basis_world[r] * basis_world[c];
+                        wtl[r * basis_count + c] += basis_world[r] * basis_local[c];
+                    }
+                }
+            }
+
+            std::vector<double> rhs = wtl; // Solves for K^T in W * K^T = L
+            if (!solve_linear_system(std::move(wtw), rhs, basis_count, basis_count)) {
+                return std::nullopt;
+            }
+
+            // Coefficient row-vectors transform as c' = c * K, where K = (K^T)^T.
+            std::vector<float> coeff_matrix(static_cast<size_t>(basis_count * basis_count), 0.0f);
+            for (int r = 0; r < basis_count; ++r) {
+                for (int c = 0; c < basis_count; ++c) {
+                    coeff_matrix[r * basis_count + c] = static_cast<float>(rhs[c * basis_count + r]);
+                }
+            }
+            return coeff_matrix;
+        }
+
+        [[nodiscard]] bool rotate_sh_coefficients(SplatData& splat_data, const glm::mat3& rotation_local_to_world) {
+            if (!splat_data.shN().is_valid() || splat_data.get_max_sh_degree() <= 0) {
+                return true;
+            }
+
+            // shN is stored swizzled. Materialise the canonical [N, K, 3] view, rotate band
+            // coefficients on it, then reswizzle.
+            Tensor shN_canon = splat_data.shN_canonical();
+            const int available_coeffs = shN_canon.ndim() >= 2 ? static_cast<int>(shN_canon.size(1)) : 0;
+            if (available_coeffs <= 0) {
+                return true;
+            }
+
+            if (splat_data.get_max_sh_degree() > 3) {
+                return false;
+            }
+
+            const int max_band = std::min(3, splat_data.get_max_sh_degree());
+            const auto device = shN_canon.device();
+
+            for (int band = 1; band <= max_band; ++band) {
+                const int coeff_count = 2 * band + 1;
+                const int offset = sh_band_offset_in_rest(band);
+                if (offset + coeff_count > available_coeffs) {
+                    break;
+                }
+
+                const auto coeff_matrix = compute_sh_coeff_rotation_matrix(rotation_local_to_world, band);
+                if (!coeff_matrix.has_value()) {
+                    return false;
+                }
+
+                const Tensor coeff_matrix_tensor = Tensor::from_vector(
+                    coeff_matrix.value(),
+                    TensorShape({static_cast<size_t>(coeff_count), static_cast<size_t>(coeff_count)}),
+                    device);
+
+                const Tensor band_coeffs = shN_canon.slice(1, offset, offset + coeff_count).contiguous();
+                // band_coeffs: [N, coeff_count, 3] → permute to [3, N, coeff_count]
+                // matmul broadcasts coeff_matrix [cc, cc] across batch dim 3
+                const Tensor channels_first = band_coeffs.permute({2, 0, 1});
+                const Tensor rotated = channels_first.matmul(coeff_matrix_tensor);
+                const Tensor rotated_band = rotated.permute({1, 2, 0});
+                shN_canon.slice(1, offset, offset + coeff_count).copy_from(rotated_band);
+            }
+
+            splat_data.shN_set_from_canonical(shN_canon, splat_data.means().capacity());
+            return true;
+        }
+
+    } // namespace
 
     SplatData& transform(SplatData& splat_data, const glm::mat4& transform_matrix) {
         LOG_TIMER("transform");
@@ -56,8 +287,10 @@ namespace lfs::core {
 
         glm::quat rotation_quat = glm::quat_cast(rot_mat);
 
-        // 3. Transform rotations (quaternions) if there's rotation
-        if (std::abs(rotation_quat.w - 1.0f) > 1e-6f) {
+        const bool has_rotation = has_significant_rotation(rotation_quat);
+
+        // 3. Transform rotations (quaternions) and SH orientation if there's rotation
+        if (has_rotation) {
             std::vector<float> rot_data = {rotation_quat.w, rotation_quat.x, rotation_quat.y, rotation_quat.z};
             auto rot_tensor = Tensor::from_vector(rot_data, TensorShape({4}), device);
 
@@ -86,6 +319,10 @@ namespace lfs::core {
                 y_new.unsqueeze(1),
                 z_new.unsqueeze(1)};
             splat_data._rotation = Tensor::cat(components, 1);
+
+            if (!rotate_sh_coefficients(splat_data, rot_mat)) {
+                throw std::runtime_error("SH rotation during transform is only supported up to degree 3.");
+            }
         }
 
         // 4. Transform scaling
@@ -184,9 +421,32 @@ namespace lfs::core {
 
         auto cropped_means = splat_data._means.index_select(0, indices).contiguous();
         auto cropped_sh0 = splat_data._sh0.index_select(0, indices).contiguous();
-        Tensor cropped_shN = splat_data._shN.is_valid()
-                                 ? splat_data._shN.index_select(0, indices).contiguous()
-                                 : Tensor{};
+        Tensor cropped_shN;
+        const size_t layout_rest = splat_data.max_sh_coeffs_rest();
+        if (splat_data._shN.is_valid() && splat_data._shN.numel() > 0 && layout_rest > 0) {
+            cropped_shN = Tensor::empty({static_cast<size_t>(points_selected), layout_rest, 3},
+                                        splat_data._shN.device());
+            if (indices.dtype() == DataType::Int64) {
+                shN_swizzled_gather_to_linear_i64(
+                    splat_data._shN.ptr<float>(),
+                    indices.ptr<int64_t>(),
+                    cropped_shN.ptr<float>(),
+                    static_cast<size_t>(points_selected),
+                    static_cast<uint32_t>(layout_rest),
+                    static_cast<uint32_t>(layout_rest));
+            } else {
+                auto indices_i32 = indices.dtype() == DataType::Int32
+                                       ? indices
+                                       : indices.to(DataType::Int32);
+                shN_swizzled_gather_to_linear(
+                    splat_data._shN.ptr<float>(),
+                    indices_i32.ptr<int>(),
+                    cropped_shN.ptr<float>(),
+                    static_cast<size_t>(points_selected),
+                    static_cast<uint32_t>(layout_rest),
+                    static_cast<uint32_t>(layout_rest));
+            }
+        }
         auto cropped_scaling = splat_data._scaling.index_select(0, indices).contiguous();
         auto cropped_rotation = splat_data._rotation.index_select(0, indices).contiguous();
         auto cropped_opacity = splat_data._opacity.index_select(0, indices).contiguous();
@@ -315,25 +575,100 @@ namespace lfs::core {
         std::mt19937 rng(seed);
         std::shuffle(all_indices.begin(), all_indices.end(), rng);
 
-        std::vector<int> selected_indices(all_indices.begin(),
-                                          all_indices.begin() + num_required_splat);
+        std::vector<unsigned char> old_frozen(static_cast<size_t>(num_points), 0);
+        if (!splat_data._frozen_ranges.empty()) {
+            for (const auto& range : splat_data._frozen_ranges) {
+                if (range.count == 0 || range.start >= old_frozen.size()) {
+                    continue;
+                }
+                const size_t end = range.count > old_frozen.size() - range.start
+                                       ? old_frozen.size()
+                                       : range.start + range.count;
+                std::fill(old_frozen.begin() + static_cast<std::ptrdiff_t>(range.start),
+                          old_frozen.begin() + static_cast<std::ptrdiff_t>(end),
+                          1);
+            }
+        }
+        const size_t frozen_total = std::count(old_frozen.begin(), old_frozen.end(), 1);
+
+        std::vector<int> selected_indices;
+        selected_indices.reserve(static_cast<size_t>(num_required_splat));
+        if (splat_data._frozen_ranges.empty()) {
+            selected_indices.assign(all_indices.begin(), all_indices.begin() + num_required_splat);
+        } else {
+            std::vector<int> trainable_indices;
+            trainable_indices.reserve(all_indices.size());
+            for (const int idx : all_indices) {
+                if (old_frozen[static_cast<size_t>(idx)]) {
+                    if (static_cast<int>(selected_indices.size()) < num_required_splat) {
+                        selected_indices.push_back(idx);
+                    }
+                } else {
+                    trainable_indices.push_back(idx);
+                }
+            }
+
+            if (frozen_total > static_cast<size_t>(num_required_splat)) {
+                LOG_WARN("random_choose kept only frozen rows because requested count {} is smaller than frozen count",
+                         num_required_splat);
+            }
+            for (const int idx : trainable_indices) {
+                if (static_cast<int>(selected_indices.size()) >= num_required_splat) {
+                    break;
+                }
+                selected_indices.push_back(idx);
+            }
+        }
 
         auto indices_tensor = Tensor::from_vector(
             selected_indices,
             TensorShape({static_cast<size_t>(num_required_splat)}),
             splat_data._means.device());
 
+        Tensor shN_selected_swizzled;
+        const auto layout_rest = static_cast<uint32_t>(splat_data.max_sh_coeffs_rest());
+        if (splat_data._shN.is_valid() && splat_data._shN.numel() > 0 &&
+            layout_rest > 0) {
+            shN_selected_swizzled = Tensor::zeros_direct(
+                {sh_swizzled_float_count(static_cast<size_t>(num_required_splat), layout_rest)},
+                sh_swizzled_float_count(static_cast<size_t>(num_required_splat), layout_rest),
+                splat_data._shN.device());
+            auto indices_i32 = indices_tensor.dtype() == DataType::Int32
+                                   ? indices_tensor
+                                   : indices_tensor.to(DataType::Int32);
+            shN_swizzled_gather_self(
+                splat_data._shN.ptr<float>(),
+                shN_selected_swizzled.ptr<float>(),
+                indices_i32.ptr<int>(),
+                static_cast<size_t>(num_required_splat),
+                0,
+                layout_rest);
+        }
+
         splat_data._means = splat_data._means.index_select(0, indices_tensor).contiguous();
         splat_data._sh0 = splat_data._sh0.index_select(0, indices_tensor).contiguous();
-        if (splat_data._shN.is_valid()) {
-            splat_data._shN = splat_data._shN.index_select(0, indices_tensor).contiguous();
+        if (shN_selected_swizzled.is_valid() && shN_selected_swizzled.numel() > 0) {
+            splat_data._shN = std::move(shN_selected_swizzled);
         }
         splat_data._scaling = splat_data._scaling.index_select(0, indices_tensor).contiguous();
         splat_data._rotation = splat_data._rotation.index_select(0, indices_tensor).contiguous();
         splat_data._opacity = splat_data._opacity.index_select(0, indices_tensor).contiguous();
+        if (!splat_data._frozen_ranges.empty()) {
+            splat_data.remap_frozen_ranges_after_keep(
+                static_cast<size_t>(num_points),
+                selected_indices);
+        }
 
-        if (splat_data._densification_info.is_valid() && splat_data._densification_info.size(0) == num_points) {
-            splat_data._densification_info = splat_data._densification_info.index_select(0, indices_tensor).contiguous();
+        if (splat_data._densification_info.is_valid()) {
+            if (splat_data._densification_info.ndim() == 1 &&
+                splat_data._densification_info.size(0) == num_points) {
+                splat_data._densification_info =
+                    splat_data._densification_info.index_select(0, indices_tensor).contiguous();
+            } else if (splat_data._densification_info.ndim() == 2 &&
+                       splat_data._densification_info.size(1) == num_points) {
+                splat_data._densification_info =
+                    splat_data._densification_info.index_select(1, indices_tensor).contiguous();
+            }
         }
 
         Tensor scene_center = splat_data._means.mean({0}, false);
@@ -445,9 +780,32 @@ namespace lfs::core {
             indices = indices.squeeze(1);
         }
 
-        Tensor shN_selected = splat_data._shN.is_valid()
-                                  ? splat_data._shN.index_select(0, indices).contiguous()
-                                  : Tensor{};
+        Tensor shN_selected;
+        const size_t layout_rest = splat_data.max_sh_coeffs_rest();
+        if (splat_data._shN.is_valid() && splat_data._shN.numel() > 0 && layout_rest > 0) {
+            shN_selected = Tensor::empty({static_cast<size_t>(count), layout_rest, 3},
+                                         splat_data._shN.device());
+            if (indices.dtype() == DataType::Int64) {
+                shN_swizzled_gather_to_linear_i64(
+                    splat_data._shN.ptr<float>(),
+                    indices.ptr<int64_t>(),
+                    shN_selected.ptr<float>(),
+                    static_cast<size_t>(count),
+                    static_cast<uint32_t>(layout_rest),
+                    static_cast<uint32_t>(layout_rest));
+            } else {
+                auto indices_i32 = indices.dtype() == DataType::Int32
+                                       ? indices
+                                       : indices.to(DataType::Int32);
+                shN_swizzled_gather_to_linear(
+                    splat_data._shN.ptr<float>(),
+                    indices_i32.ptr<int>(),
+                    shN_selected.ptr<float>(),
+                    static_cast<size_t>(count),
+                    static_cast<uint32_t>(layout_rest),
+                    static_cast<uint32_t>(layout_rest));
+            }
+        }
 
         SplatData result(
             splat_data._max_sh_degree,
@@ -459,6 +817,12 @@ namespace lfs::core {
             splat_data._opacity.index_select(0, indices).contiguous(),
             splat_data._scene_scale);
         result.set_active_sh_degree(splat_data._active_sh_degree);
+
+        // If the mask keeps every gaussian, preserve the LOD tree unchanged.
+        if (count == static_cast<int>(splat_data.size()) && splat_data.lod_tree) {
+            result.lod_tree = std::make_unique<lfs::core::SplatLodTree>(*splat_data.lod_tree);
+        }
+
         return result;
     }
 

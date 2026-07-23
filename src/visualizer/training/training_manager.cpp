@@ -3,122 +3,233 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "training/training_manager.hpp"
+#include "core/error_envelope.hpp"
+#include "core/error_reporter.hpp"
 #include "core/events.hpp"
+#include "core/guarded_task.hpp"
 #include "core/logger.hpp"
 #include "core/parameter_manager.hpp"
+#include "core/scene.hpp"
 #include "core/services.hpp"
-#include "scene/scene.hpp"
+#include "core/tensor.hpp"
+#include "core/tensor/internal/tensor_ops.hpp"
+#include "python/python_runtime.hpp"
+#include "rendering/vulkan_external_tensor.hpp"
+#include "training/rasterization/fast_rasterizer.hpp"
+#include "training/rasterization/gsplat/Ops.h"
+#include "training/rasterization/gsplat_rasterizer.hpp"
 #include "training/training_setup.hpp"
+#include "visualizer/visualizer_impl.hpp"
+#include "window/vulkan_context.hpp"
+#include "window/window_manager.hpp"
+
+#include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <cuda_runtime.h>
+#include <format>
 #include <stdexcept>
+#include <thread>
+#include <utility>
 
 namespace lfs::vis {
 
     using namespace lfs::core::events;
 
+    namespace {
+        [[nodiscard]] std::vector<size_t> normalize_save_steps(std::vector<size_t> steps) {
+            steps.erase(std::remove(steps.begin(), steps.end(), 0), steps.end());
+            std::sort(steps.begin(), steps.end());
+            steps.erase(std::unique(steps.begin(), steps.end()), steps.end());
+            return steps;
+        }
+
+        void apply_save_steps(lfs::core::param::OptimizationParameters& params,
+                              const std::vector<size_t>& steps) {
+            params.save_steps = steps;
+            if (params.enable_eval)
+                params.eval_steps = steps;
+        }
+
+        void release_training_thread_local_cuda_caches() noexcept {
+            (void)lfs::training::release_fast_rasterizer_thread_local_caches();
+            (void)lfs::training::release_gsplat_rasterizer_thread_local_caches();
+            (void)gsplat_lfs::release_intersect_thread_local_cache();
+            (void)lfs::core::tensor_ops::release_nan_check_thread_buffers();
+        }
+
+        [[nodiscard]] lfs::core::SplatTensorAllocator makeVulkanTrainingTensorAllocator(VisualizerImpl* viewer) {
+            if (!viewer || !viewer->getWindowManager()) {
+                return {};
+            }
+            auto* const context = viewer->getWindowManager()->getVulkanContext();
+            if (!context || !context->externalMemoryInteropEnabled()) {
+                return {};
+            }
+
+            return [context](lfs::core::TensorShape shape,
+                             const size_t capacity,
+                             const lfs::core::DataType dtype,
+                             const std::string_view name) -> lfs::core::Tensor {
+                const std::string debug_name{name};
+                auto tensor = makeVulkanExternalTensor(
+                    *context,
+                    std::move(shape),
+                    dtype,
+                    capacity,
+                    debug_name.c_str());
+                if (!tensor) {
+                    throw lfs::core::TensorError(std::format(
+                        "Vulkan-external training tensor allocation failed for '{}': {}",
+                        debug_name,
+                        tensor.error()));
+                }
+                tensor->set_name(debug_name);
+                return std::move(*tensor);
+            };
+        }
+    } // namespace
+
     TrainerManager::TrainerManager() {
         setupEventHandlers();
         setupStateMachineCallbacks();
+        completion_reaper_ = std::jthread([this](const std::stop_token stop_token) {
+            completionReaperLoop(stop_token);
+        });
         LOG_DEBUG("TrainerManager created");
     }
 
-    void TrainerManager::setupStateMachineCallbacks() {
-        state_machine_.setCleanupCallback([this](const TrainingResources& resources) {
-            cleanupTrainingResources(resources);
-        });
+    lfs::core::SplatTensorAllocator TrainerManager::createTrainingSplatTensorAllocator(
+        const lfs::core::param::TrainingParameters& params,
+        const std::size_t min_capacity) {
+        splat_storage_.reset();
+        lfs::core::SplatTensorAllocator tensor_allocator;
 
-        state_machine_.setStateChangeCallback([this](TrainingState old_state, TrainingState new_state) {
+        const std::size_t configured_capacity =
+            params.optimization.max_cap > 0
+                ? static_cast<std::size_t>(params.optimization.max_cap)
+                : 0;
+        const std::size_t exportable_capacity = std::max(configured_capacity, min_capacity);
+        const int sh_degree = params.optimization.sh_degree;
+
+        VulkanContext* vk_ctx = nullptr;
+        if (viewer_ && viewer_->getWindowManager()) {
+            vk_ctx = viewer_->getWindowManager()->getVulkanContext();
+        }
+        const bool vulkan_interop_available =
+            vk_ctx && vk_ctx->externalMemoryInteropEnabled();
+
+        if (vulkan_interop_available && exportable_capacity > 0) {
+            auto storage_result =
+                lfs::core::SplatExportableStorage::create(exportable_capacity, sh_degree);
+            if (storage_result) {
+                splat_storage_ = std::move(*storage_result);
+                auto interop_alloc_result =
+                    makeSplatExportableInteropAllocator(*vk_ctx, *splat_storage_);
+                if (interop_alloc_result) {
+                    tensor_allocator = std::move(*interop_alloc_result);
+                    LOG_INFO("Training tensors share one CUDA-exportable VMM block "
+                             "imported into Vulkan (capacity={}, sh_degree={}, "
+                             "block={} MiB) — zero-copy viewer interop",
+                             exportable_capacity,
+                             sh_degree,
+                             splat_storage_->block->size >> 20);
+                } else {
+                    LOG_WARN("Exportable-interop allocator failed ({}); dropping storage "
+                             "and falling back to legacy Vulkan-external allocator",
+                             interop_alloc_result.error());
+                    splat_storage_.reset();
+                }
+            } else {
+                LOG_WARN("SplatExportableStorage creation failed ({}); falling back to "
+                         "legacy Vulkan-external allocator",
+                         storage_result.error());
+            }
+        }
+
+        if (!tensor_allocator) {
+            tensor_allocator = makeVulkanTrainingTensorAllocator(viewer_);
+            if (tensor_allocator) {
+                LOG_INFO("Training model tensors will use Vulkan-external CUDA storage");
+            }
+        }
+
+        return tensor_allocator;
+    }
+
+    void TrainerManager::setupStateMachineCallbacks() {
+        state_machine_.setStateChangeCallback([this](TrainingState, TrainingState new_state) {
             // Emit events on state changes
             if (new_state == TrainingState::Idle) {
-                loss_buffer_.clear();
+                {
+                    std::lock_guard<std::mutex> lock(loss_buffer_mutex_);
+                    loss_buffer_.clear();
+                }
+                clearEvaluationMetrics();
                 last_error_.clear();
+                last_training_error_.clear();
             }
         });
-    }
-
-    void TrainerManager::cleanupTrainingResources(const TrainingResources& /*resources*/) {
-        LOG_DEBUG("Cleaning up training resources");
-
-        if (training_thread_ && training_thread_->joinable()) {
-            training_thread_->request_stop();
-            auto timeout = std::chrono::milliseconds(500);
-            {
-                std::unique_lock<std::mutex> lock(completion_mutex_);
-                if (completion_cv_.wait_for(lock, timeout, [this] { return training_complete_; })) {
-                    lock.unlock();
-                    training_thread_->join();
-                } else {
-                    lock.unlock();
-                    LOG_WARN("Thread didn't respond to stop request, detaching");
-                    training_thread_->detach();
-                }
-            }
-            training_thread_.reset();
-        }
-
-        if (trainer_) {
-            trainer_->shutdown();
-            trainer_.reset();
-        }
-    }
-
-    void TrainerManager::updateResourceTracking() {
-        TrainingResources resources;
-        resources.has_trainer = trainer_ != nullptr;
-        resources.has_training_thread = training_thread_ != nullptr && training_thread_->joinable();
-        resources.has_scene_data = scene_ != nullptr;
-        resources.has_gpu_tensors = trainer_ && trainer_->isInitialized();
-        if (scene_) {
-            resources.training_node_name = scene_->getTrainingModelNodeName();
-        }
-        state_machine_.setResources(resources);
     }
 
     TrainerManager::~TrainerManager() {
-        // Ensure training is stopped before destruction
-        if (training_thread_ && training_thread_->joinable()) {
+        if (isCompletionPending()) {
             LOG_INFO("Stopping training thread during destruction...");
-            stopTraining();
-            waitForCompletion();
+            if (canStop()) {
+                stopTraining();
+            } else if (trainer_) {
+                trainer_->request_stop();
+            }
+            if (!waitForCompletion()) {
+                LOG_WARN("Training worker exceeded the shutdown completion timeout");
+            }
+        }
+        completion_reaper_.request_stop();
+        training_thread_cv_.notify_all();
+        if (completion_reaper_.joinable()) {
+            completion_reaper_.join();
         }
     }
 
     void TrainerManager::setTrainer(std::unique_ptr<lfs::training::Trainer> trainer) {
         LOG_TIMER_TRACE("TrainerManager::setTrainer");
 
-        clearTrainer();
+        if (!clearTrainer()) {
+            LOG_ERROR("Cannot install trainer while the previous training worker is still stopping");
+            return;
+        }
 
         if (trainer) {
             const auto& params = trainer->getParams();
             pending_opt_params_ = params.optimization;
             pending_dataset_params_ = params.dataset;
 
+            std::lock_guard<std::mutex> lock(trainer_lifetime_mutex_);
             trainer_ = std::move(trainer);
-            updateResourceTracking();
-
             if (!state_machine_.transitionTo(TrainingState::Ready)) {
                 LOG_WARN("Failed to transition to Ready");
             }
 
             internal::TrainerReady{}.emit();
-            LOG_DEBUG("Trainer ready");
         }
     }
 
     void TrainerManager::setTrainerFromCheckpoint(std::unique_ptr<lfs::training::Trainer> trainer, int checkpoint_iteration) {
         LOG_TIMER_TRACE("TrainerManager::setTrainerFromCheckpoint");
 
-        clearTrainer();
+        if (!clearTrainer()) {
+            LOG_ERROR("Cannot install checkpoint trainer while the previous training worker is still stopping");
+            return;
+        }
 
         if (trainer) {
             const auto& params = trainer->getParams();
             pending_opt_params_ = params.optimization;
             pending_dataset_params_ = params.dataset;
 
+            std::lock_guard<std::mutex> lock(trainer_lifetime_mutex_);
             trainer_ = std::move(trainer);
-            updateResourceTracking();
-            // Checkpoint load goes to Paused
+            internal::TrainerReady{}.emit();
 
             if (!state_machine_.transitionTo(TrainingState::Paused)) {
                 LOG_WARN("Failed to transition to Paused");
@@ -133,36 +244,50 @@ namespace lfs::vis {
         return trainer_ != nullptr;
     }
 
-    void TrainerManager::clearTrainer() {
+    bool TrainerManager::clearTrainer() {
         LOG_DEBUG("Clearing trainer");
 
-        // Stop any ongoing training first
         const auto state = getState();
         if (state == TrainingState::Running || state == TrainingState::Paused) {
             LOG_INFO("Stopping active training before clearing");
-            // If paused, resume first so thread can process stop request
             if (state == TrainingState::Paused && trainer_) {
                 trainer_->request_resume();
             }
             stopTraining();
-            waitForCompletion();
-        } else if (state == TrainingState::Stopping) {
-            // Already stopping, just wait for completion
-            LOG_INFO("Waiting for training to finish stopping");
-            waitForCompletion();
         }
 
-        // Destroy trainer - destructor handles cleanup
-        trainer_.reset();
+        if (isCompletionPending()) {
+            if (viewer_ && viewer_->isOnViewerThread()) {
+                LOG_ERROR("Trainer clear deferred until the training completion event");
+                return false;
+            }
+            LOG_INFO("Waiting for training thread before clearing trainer");
+            if (!waitForCompletion()) {
+                LOG_ERROR("Trainer clear deferred: training worker did not reach its terminal state");
+                return false;
+            }
+        }
 
-        // Transition to Idle
-        updateResourceTracking();
+        {
+            std::lock_guard<std::mutex> lock(trainer_lifetime_mutex_);
+            trainer_.reset();
+            // Model tensors retain their own shared ownership while edit/view mode
+            // still uses the exportable block. The manager must not remain the final
+            // owner after scene teardown.
+            splat_storage_.reset();
+        }
+        // Trainer::shutdown() trims before Tensor-valued members are destroyed.
+        // Trim again after destruction so those returned blocks do not survive clear.
+        lfs::core::Tensor::trim_memory_pool();
 
-        if (!state_machine_.transitionTo(TrainingState::Idle)) {
+        if (getState() != TrainingState::Idle && !state_machine_.transitionTo(TrainingState::Idle)) {
             LOG_WARN("Failed to transition to Idle");
         }
 
+        python::update_training_state(false, "idle");
+        python::update_trainer_loaded(false, 0);
         LOG_INFO("Trainer cleared");
+        return true;
     }
 
     bool TrainerManager::startTraining() {
@@ -178,17 +303,94 @@ namespace lfs::vis {
             return false;
         }
 
+        clearEvaluationMetrics();
         applyPendingParams();
 
+        if (auto error = trainer_->getParams().validate(); !error.empty()) {
+            LOG_ERROR("Cannot start training: {}", error);
+            last_error_ = error;
+            lfs::Error typed = lfs::make_legacy_error(error, lfs::LegacyErrorContext{
+                                                                 .code = lfs::ErrorCode::InvalidArgument,
+                                                                 .domain = lfs::ErrorDomain::Training,
+                                                                 .operation = "training.start",
+                                                                 .source = LFS_SOURCE_SITE_CURRENT(),
+                                                                 .operation_id = lfs::OperationId::generate(),
+                                                             });
+            state::TrainingCompleted{
+                .iteration = 0,
+                .final_loss = 0.0f,
+                .elapsed_seconds = 0.0f,
+                .success = false,
+                .user_stopped = false,
+                .error = last_error_,
+                .error_info = core::to_wire_error(typed)}
+                .emit();
+            last_training_error_.set(std::move(typed));
+            if (!state_machine_.transitionToFinished(FinishReason::Error)) {
+                LOG_WARN("Failed to transition to Finished(Error)");
+            }
+            return false;
+        }
+
         if (trainer_->isInitialized()) {
+            const auto& params = trainer_->getParams();
+            auto* model = scene_ ? scene_->getTrainingModel() : nullptr;
+            const std::size_t model_size = model ? static_cast<std::size_t>(model->size()) : 0;
+            auto tensor_allocator = scene_ ? createTrainingSplatTensorAllocator(params, model_size)
+                                           : lfs::core::SplatTensorAllocator{};
+            const bool force_reallocation = splat_storage_.has_value();
+            if (scene_ && tensor_allocator) {
+                trainer_->setSplatTensorAllocator(tensor_allocator);
+                if (model) {
+                    if (auto result = lfs::training::migrateTrainingModelToAllocator(
+                            params, *model, tensor_allocator, force_reallocation);
+                        !result) {
+                        LOG_ERROR("Failed to migrate initialized training model: {}", result.error());
+                        last_error_ = result.error();
+                        lfs::Error typed = lfs::make_legacy_error(result.error(), lfs::LegacyErrorContext{
+                                                                                      .code = lfs::ErrorCode::FailedPrecondition,
+                                                                                      .domain = lfs::ErrorDomain::Training,
+                                                                                      .operation = "training.start",
+                                                                                      .source = LFS_SOURCE_SITE_CURRENT(),
+                                                                                      .operation_id = lfs::OperationId::generate(),
+                                                                                  });
+                        state::TrainingCompleted{
+                            .iteration = getCurrentIteration(),
+                            .final_loss = 0.0f,
+                            .elapsed_seconds = 0.0f,
+                            .success = false,
+                            .user_stopped = false,
+                            .error = last_error_,
+                            .error_info = core::to_wire_error(typed)}
+                            .emit();
+                        last_training_error_.set(std::move(typed));
+                        if (!state_machine_.transitionToFinished(FinishReason::Error)) {
+                            LOG_WARN("Failed to transition to Finished(Error)");
+                        }
+                        return false;
+                    }
+                }
+            }
             LOG_DEBUG("Resuming from iteration {}", trainer_->get_current_iteration());
         } else {
             const auto& params = trainer_->getParams();
 
             if (scene_) {
-                if (auto result = lfs::training::initializeTrainingModel(params, *scene_); !result) {
+                auto tensor_allocator = createTrainingSplatTensorAllocator(params);
+                trainer_->setSplatTensorAllocator(tensor_allocator);
+                if (auto result = lfs::training::initializeTrainingModel(
+                        params, *scene_, std::move(tensor_allocator));
+                    !result) {
                     LOG_ERROR("Failed to initialize model: {}", result.error());
                     last_error_ = result.error();
+
+                    lfs::Error typed = lfs::make_legacy_error(last_error_, lfs::LegacyErrorContext{
+                                                                               .code = lfs::ErrorCode::FailedPrecondition,
+                                                                               .domain = lfs::ErrorDomain::Training,
+                                                                               .operation = "training.start",
+                                                                               .source = LFS_SOURCE_SITE_CURRENT(),
+                                                                               .operation_id = lfs::OperationId::generate(),
+                                                                           });
 
                     std::string error_msg = result.error();
                     if (auto pos = error_msg.find("CUDA out of memory"); pos != std::string::npos) {
@@ -199,19 +401,31 @@ namespace lfs::vis {
                         .final_loss = 0.0f,
                         .elapsed_seconds = 0.0f,
                         .success = false,
-                        .error = error_msg}
+                        .user_stopped = false,
+                        .error = error_msg,
+                        .error_info = core::to_wire_error(typed)}
                         .emit();
+                    last_training_error_.set(std::move(typed));
 
                     if (!state_machine_.transitionToFinished(FinishReason::Error)) {
                         LOG_WARN("Failed to transition to Finished(Error)");
                     }
                     return false;
                 }
+                lfs::core::Tensor::log_storage_memory("After training model initialization");
             }
 
             if (auto result = trainer_->initialize(params); !result) {
                 LOG_ERROR("Failed to initialize trainer: {}", result.error());
                 last_error_ = result.error();
+
+                lfs::Error typed = lfs::make_legacy_error(last_error_, lfs::LegacyErrorContext{
+                                                                           .code = lfs::ErrorCode::FailedPrecondition,
+                                                                           .domain = lfs::ErrorDomain::Training,
+                                                                           .operation = "training.start",
+                                                                           .source = LFS_SOURCE_SITE_CURRENT(),
+                                                                           .operation_id = lfs::OperationId::generate(),
+                                                                       });
 
                 std::string error_msg = result.error();
                 if (auto pos = error_msg.find("CUDA out of memory"); pos != std::string::npos) {
@@ -222,22 +436,43 @@ namespace lfs::vis {
                     .final_loss = 0.0f,
                     .elapsed_seconds = 0.0f,
                     .success = false,
-                    .error = error_msg}
+                    .user_stopped = false,
+                    .error = error_msg,
+                    .error_info = core::to_wire_error(typed)}
                     .emit();
+                last_training_error_.set(std::move(typed));
 
                 if (!state_machine_.transitionToFinished(FinishReason::Error)) {
                     LOG_WARN("Failed to transition to Finished(Error)");
                 }
                 return false;
             }
+            lfs::core::Tensor::log_storage_memory("After trainer initialization");
+
+            // Match headless mode: release init-time cached pool allocations before the
+            // first training batch spins up image decoders and render workspaces.
+            lfs::core::Tensor::trim_memory_pool();
         }
 
-        {
-            std::lock_guard<std::mutex> lock(completion_mutex_);
-            training_complete_ = false;
+        if (viewer_) {
+            auto* const rendering_manager = viewer_->getRenderingManager();
+            auto* const window_manager = viewer_->getWindowManager();
+            auto* const vulkan_context = window_manager ? window_manager->getVulkanContext() : nullptr;
+            auto* const model = scene_ ? scene_->getTrainingModel() : nullptr;
+            if (rendering_manager && vulkan_context && model) {
+                glm::ivec2 prime_size = rendering_manager->getRenderedSize();
+                if (prime_size.x <= 0 || prime_size.y <= 0) {
+                    prime_size = window_manager ? window_manager->getWindowSize() : glm::ivec2{1280, 720};
+                }
+                if (auto ok = rendering_manager->ensureVksplatTrainingSharedScratchReady(
+                        *vulkan_context,
+                        *model,
+                        prime_size);
+                    !ok) {
+                    LOG_WARN("VkSplat training shared-scratch pre-start prime skipped: {}", ok.error());
+                }
+            }
         }
-
-        updateResourceTracking();
 
         if (!state_machine_.transitionTo(TrainingState::Running)) {
             LOG_WARN("Failed to transition to Running");
@@ -248,10 +483,7 @@ namespace lfs::vis {
 
         state::TrainingStarted{.total_iterations = getTotalIterations()}.emit();
 
-        training_thread_ = std::make_unique<std::jthread>(
-            [this](std::stop_token stop_token) {
-                trainingThreadFunc(stop_token);
-            });
+        launchTrainingThread();
 
         LOG_INFO("Training started - {} iterations planned", getTotalIterations());
         return true;
@@ -285,21 +517,17 @@ namespace lfs::vis {
             return;
 
         const int iter = getCurrentIteration();
-        const bool need_thread = !training_thread_ || !training_thread_->joinable();
+        const bool need_thread = !isCompletionPending();
 
         if (need_thread) {
             // Checkpoint resume: no thread exists yet
-            training_complete_ = false;
             accumulated_training_time_ = std::chrono::steady_clock::duration{0};
-            training_thread_ = std::make_unique<std::jthread>(
-                [this](std::stop_token st) { trainingThreadFunc(st); });
+            launchTrainingThread();
         } else {
             trainer_->request_resume();
         }
 
         training_start_time_ = std::chrono::steady_clock::now();
-        updateResourceTracking();
-
         if (!state_machine_.transitionTo(TrainingState::Running)) {
             LOG_WARN("Failed to transition to Running");
         }
@@ -309,22 +537,155 @@ namespace lfs::vis {
     }
 
     void TrainerManager::pauseTrainingTemporary() {
-        if (!isRunning())
+        if (!isRunning() || !trainer_) {
             return;
-
-        if (trainer_) {
-            trainer_->request_pause();
-            LOG_TRACE("Training temporarily paused at iteration {}", getCurrentIteration());
         }
+
+        const int iteration = getCurrentIteration();
+        const bool was_paused = trainer_->is_paused();
+        {
+            std::lock_guard lock(temporary_pause_mutex_);
+            if (temporary_pause_depth_ == 0) {
+                temporary_pause_initially_paused_ = was_paused && !temporary_pause_resume_in_flight_;
+                temporary_pause_resume_in_flight_ = false;
+            }
+            ++temporary_pause_depth_;
+        }
+
+        trainer_->request_pause();
+        LOG_TRACE("Training temporary pause requested at iteration {}", iteration);
+    }
+
+    bool TrainerManager::pauseTrainingTemporaryIfActive() {
+        if (!isRunning() || !trainer_ || trainer_->is_paused()) {
+            return false;
+        }
+
+        pauseTrainingTemporary();
+        return true;
+    }
+
+    TrainerManager::TemporaryPauseResult
+    TrainerManager::pauseTrainingTemporaryAndWait(const std::chrono::milliseconds timeout) {
+        if (!isRunning() || !trainer_) {
+            return {};
+        }
+
+        const int start_iteration = getCurrentIteration();
+        const bool was_paused = trainer_->is_paused();
+        {
+            std::lock_guard lock(temporary_pause_mutex_);
+            if (temporary_pause_depth_ == 0) {
+                temporary_pause_initially_paused_ = was_paused && !temporary_pause_resume_in_flight_;
+                temporary_pause_resume_in_flight_ = false;
+            }
+            ++temporary_pause_depth_;
+        }
+
+        const auto release_failed_lease = [&]() -> bool {
+            bool resume_training = false;
+            bool initially_paused = false;
+            const bool can_resume = isRunning() && trainer_ != nullptr;
+            {
+                std::lock_guard lock(temporary_pause_mutex_);
+                if (temporary_pause_depth_ == 0) {
+                    LOG_WARN("Temporary training pause lease release underflow");
+                    return false;
+                }
+                initially_paused = temporary_pause_initially_paused_;
+                --temporary_pause_depth_;
+                resume_training = temporary_pause_depth_ == 0 && !initially_paused;
+                if (temporary_pause_depth_ == 0) {
+                    temporary_pause_initially_paused_ = false;
+                    temporary_pause_resume_in_flight_ = resume_training && can_resume;
+                }
+            }
+            return resume_training;
+        };
+
+        trainer_->request_pause();
+
+        const auto pause_start = std::chrono::steady_clock::now();
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (isRunning() && !trainer_->is_paused()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                LOG_WARN("Timed out waiting for temporary training pause: start_iteration={}, current_iteration={}, waited_ms={}, was_paused={}",
+                         start_iteration,
+                         getCurrentIteration(),
+                         timeout.count(),
+                         was_paused);
+                const bool resume_training = release_failed_lease();
+                if (resume_training && isRunning() && trainer_) {
+                    trainer_->request_resume();
+                }
+                return {};
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+
+        if (!isRunning()) {
+            (void)release_failed_lease();
+            return {};
+        }
+
+        const auto paused_at = std::chrono::steady_clock::now();
+        const double pause_wait_ms = std::chrono::duration<double, std::milli>(paused_at - pause_start).count();
+        const auto sync_start = std::chrono::steady_clock::now();
+        const cudaError_t sync_status = cudaDeviceSynchronize();
+        const auto sync_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sync_start)
+                .count();
+        if (sync_status != cudaSuccess) {
+            LOG_WARN("CUDA sync after temporary training pause failed: error={}, sync_ms={:.1f}, start_iteration={}, current_iteration={}",
+                     cudaGetErrorString(sync_status),
+                     sync_ms,
+                     start_iteration,
+                     getCurrentIteration());
+            const bool resume_training = release_failed_lease();
+            if (resume_training && isRunning() && trainer_) {
+                trainer_->request_resume();
+            }
+            return {};
+        }
+
+        LOG_DEBUG("Training temporarily paused and synchronized: start_iteration={}, current_iteration={}, pause_wait_ms={:.1f}, sync_ms={:.1f}",
+                  start_iteration,
+                  getCurrentIteration(),
+                  pause_wait_ms,
+                  sync_ms);
+        return {
+            .synchronized = true,
+            .resume_required = true,
+        };
     }
 
     void TrainerManager::resumeTrainingTemporary() {
-        if (!isRunning())
-            return;
+        const bool running = isRunning();
+        const int iteration = getCurrentIteration();
+        const bool trainer_present = trainer_ != nullptr;
+        bool resume_training = false;
+        bool root_initially_paused = false;
+        {
+            std::lock_guard lock(temporary_pause_mutex_);
+            if (temporary_pause_depth_ == 0) {
+                LOG_WARN("Temporary training resume ignored without active lease: iteration={}, running={}, trainer_present={}",
+                         iteration,
+                         running,
+                         trainer_present);
+                return;
+            }
+            root_initially_paused = temporary_pause_initially_paused_;
+            --temporary_pause_depth_;
+            resume_training = temporary_pause_depth_ == 0 && !root_initially_paused;
+            if (temporary_pause_depth_ == 0) {
+                temporary_pause_initially_paused_ = false;
+                temporary_pause_resume_in_flight_ = resume_training && running && trainer_present;
+            }
+        }
 
-        if (trainer_) {
+        if (resume_training && running && trainer_) {
             trainer_->request_resume();
-            LOG_TRACE("Training resumed from temporary pause at iteration {}", getCurrentIteration());
+            LOG_TRACE("Training resumed from temporary pause at iteration {}", iteration);
         }
     }
 
@@ -335,8 +696,6 @@ namespace lfs::vis {
         }
 
         LOG_DEBUG("Requesting training stop");
-        updateResourceTracking();
-
         if (!state_machine_.transitionTo(TrainingState::Stopping)) {
             LOG_WARN("Failed to transition to Stopping");
         }
@@ -345,12 +704,23 @@ namespace lfs::vis {
             trainer_->request_stop();
         }
 
-        if (training_thread_ && training_thread_->joinable()) {
-            training_thread_->request_stop();
+        const bool has_thread = isCompletionPending();
+        std::optional<std::stop_source> stop_source;
+        if (has_thread) {
+            std::lock_guard lock(training_thread_mutex_);
+            stop_source = training_stop_source_;
+        }
+        if (stop_source) {
+            stop_source->request_stop();
         }
 
         state::TrainingStopped{.iteration = getCurrentIteration(), .user_requested = true}.emit();
         LOG_INFO("Training stop requested at iteration {}", getCurrentIteration());
+
+        if (!has_thread) {
+            handleTrainingComplete(true);
+            finishTrainingThreadJoin();
+        }
     }
 
     void TrainerManager::requestSaveCheckpoint() {
@@ -362,60 +732,118 @@ namespace lfs::vis {
         }
     }
 
-    bool TrainerManager::resetTraining() {
-        LOG_INFO("Resetting training to initial state");
-
-        if (!trainer_) {
-            LOG_WARN("No trainer to reset");
+    bool TrainerManager::waitForCompletion() {
+        std::unique_lock<std::mutex> lock(completion_mutex_);
+        if (viewer_ && viewer_->isOnViewerThread() && !training_joined_) {
+            LOG_ERROR("Refusing to block the viewer thread on training completion");
             return false;
         }
-
-        // Stop if active
-        if (isTrainingActive()) {
-            stopTraining();
-            waitForCompletion();
+        if (!completion_cv_.wait_for(lock, std::chrono::seconds(COMPLETION_TIMEOUT_SEC),
+                                     [this] { return training_joined_; })) {
+            LOG_ERROR("Training thread join timed out ({}s)", COMPLETION_TIMEOUT_SEC);
+            return false;
         }
-
-        if (trainer_->isInitialized()) {
-            LOG_DEBUG("Releasing GPU memory");
-            trainer_.reset();
-            cudaDeviceSynchronize();
-
-            if (!scene_) {
-                LOG_ERROR("Cannot reset: no scene");
-
-                if (!state_machine_.transitionToFinished(FinishReason::Error)) {
-                    LOG_WARN("Failed to transition to Finished(Error)");
-                }
-                return false;
-            }
-            trainer_ = std::make_unique<lfs::training::Trainer>(*scene_);
-        }
-
-        loss_buffer_.clear();
-
-        if (!state_machine_.transitionTo(TrainingState::Ready)) {
-            LOG_WARN("Failed to transition to Ready");
-        }
-
-        LOG_DEBUG("Training reset complete");
         return true;
     }
 
-    void TrainerManager::waitForCompletion() {
-        if (!training_thread_ || !training_thread_->joinable()) {
+    void TrainerManager::launchTrainingThread() {
+        {
+            std::lock_guard lock(completion_mutex_);
+            training_joined_ = false;
+            pending_completion_.reset();
+        }
+        completion_pending_.store(true, std::memory_order_release);
+
+        last_training_error_.clear();
+        auto worker = std::make_unique<std::jthread>(
+            [this](const std::stop_token stop_token) {
+                trainingThreadFunc(stop_token);
+            });
+        {
+            std::lock_guard lock(training_thread_mutex_);
+            training_stop_source_ = worker->get_stop_source();
+            training_thread_ = std::move(worker);
+        }
+        training_thread_cv_.notify_one();
+    }
+
+    void TrainerManager::completionReaperLoop(const std::stop_token stop_token) {
+        while (true) {
+            std::unique_ptr<std::jthread> worker;
+            {
+                std::unique_lock lock(training_thread_mutex_);
+                training_thread_cv_.wait(lock, [this, stop_token] {
+                    return stop_token.stop_requested() || training_thread_ != nullptr;
+                });
+                if (!training_thread_) {
+                    if (stop_token.stop_requested()) {
+                        return;
+                    }
+                    continue;
+                }
+                worker = std::move(training_thread_);
+            }
+
+            if (worker->joinable()) {
+                worker->join();
+            }
+            finishTrainingThreadJoin();
+        }
+    }
+
+    void TrainerManager::finishTrainingThreadJoin() {
+        std::optional<TrainingCompletionData> completion;
+        {
+            std::lock_guard lock(completion_mutex_);
+            training_joined_ = true;
+            completion = std::move(pending_completion_);
+            pending_completion_.reset();
+        }
+        completion_cv_.notify_all();
+
+        if (!completion) {
+            completion_pending_.store(false, std::memory_order_release);
+            LOG_ERROR("Training worker exited without terminal completion data");
             return;
         }
+        dispatchTrainingCompleted(std::move(*completion));
+    }
 
-        LOG_DEBUG("Waiting for training thread to complete...");
+    void TrainerManager::dispatchTrainingCompleted(TrainingCompletionData completion) {
+        auto emit_completion = [this, completion = std::move(completion)]() mutable {
+            if (!state_machine_.transitionToFinished(completion.reason)) {
+                LOG_WARN("Failed to transition to Finished");
+            }
+            LOG_INFO("Training finished: iter={}, loss={:.6f}, time={:.1f}s",
+                     completion.iteration, completion.final_loss, completion.elapsed_seconds);
+            completion_pending_.store(false, std::memory_order_release);
+            state::TrainingCompleted{
+                .iteration = completion.iteration,
+                .final_loss = completion.final_loss,
+                .elapsed_seconds = completion.elapsed_seconds,
+                .success = completion.success,
+                .user_stopped = completion.user_stopped,
+                .error = std::move(completion.error),
+                .resource_exhausted = completion.resource_exhausted,
+                .error_info = completion.typed_error
+                                  ? std::optional(core::to_wire_error(*completion.typed_error))
+                                  : std::nullopt}
+                .emit();
+        };
 
-        std::unique_lock<std::mutex> lock(completion_mutex_);
-        completion_cv_.wait(lock, [this] { return training_complete_; });
-
-        training_thread_->join();
-        training_thread_.reset();
-
-        LOG_DEBUG("Training thread joined successfully");
+        if (viewer_) {
+            if (!viewer_->postWork({
+                    .run = std::move(emit_completion),
+                    .cancel = [this] {
+                        completion_pending_.store(false, std::memory_order_release);
+                    },
+                })) {
+                completion_pending_.store(false, std::memory_order_release);
+                LOG_WARN("Training completion event dropped during viewer shutdown");
+            }
+            return;
+        }
+        emit_completion();
     }
 
     int TrainerManager::getCurrentIteration() const {
@@ -429,22 +857,22 @@ namespace lfs::vis {
     int TrainerManager::getTotalIterations() const {
         if (!trainer_)
             return 0;
-        return static_cast<int>(trainer_->getParams().optimization.iterations);
+        return trainer_->get_total_iterations();
     }
 
     int TrainerManager::getNumSplats() const {
         if (!trainer_)
             return 0;
-        // Strategy may not be created yet if using Scene-based constructor
-        // In that case, try to get size from scene
+
+        // Prefer scene metadata so UI polling does not dereference the live
+        // training model while topology-changing refinement is in progress.
         if (scene_) {
-            const auto* model = scene_->getTrainingModel();
-            if (model) {
-                return static_cast<int>(model->size());
-            }
+            return static_cast<int>(scene_->getTrainingModelGaussianCount());
         }
-        // Fall back to strategy if trainer is initialized
+
+        // Legacy fallback for non-scene-backed trainers.
         if (trainer_->isInitialized()) {
+            const std::shared_lock lock(trainer_->getRenderMutex());
             return static_cast<int>(trainer_->get_strategy().get_model().size());
         }
         return 0;
@@ -454,6 +882,48 @@ namespace lfs::vis {
         if (!trainer_)
             return 0;
         return trainer_->getParams().optimization.max_cap;
+    }
+
+    std::vector<size_t> TrainerManager::getSaveSteps() const {
+        if (auto* const param_mgr = services().paramsOrNull(); param_mgr && param_mgr->isLoaded())
+            return param_mgr->copyActiveParams().save_steps;
+        if (trainer_)
+            return trainer_->getParams().optimization.save_steps;
+        return pending_opt_params_.save_steps;
+    }
+
+    bool TrainerManager::canEditSaveSteps() const {
+        return !trainer_ ||
+               !trainer_->isInitialized() ||
+               !trainer_->getParams().resume_checkpoint.has_value();
+    }
+
+    bool TrainerManager::setSaveSteps(std::vector<size_t> save_steps) {
+        if (!canEditSaveSteps())
+            return false;
+
+        save_steps = normalize_save_steps(std::move(save_steps));
+        apply_save_steps(pending_opt_params_, save_steps);
+
+        bool updated_active_params = false;
+        if (auto* const param_mgr = services().paramsOrNull()) {
+            if (const auto loaded = param_mgr->ensureLoaded(); loaded) {
+                param_mgr->modifyActiveParams([&save_steps](auto& params) {
+                    apply_save_steps(params, save_steps);
+                });
+                updated_active_params = true;
+            } else {
+                LOG_WARN("Could not update save steps: {}", loaded.error());
+            }
+        }
+
+        if (!updated_active_params && trainer_) {
+            auto params = trainer_->getParams();
+            apply_save_steps(params.optimization, save_steps);
+            trainer_->setParams(params);
+        }
+
+        return true;
     }
 
     const char* TrainerManager::getStrategyType() const {
@@ -506,36 +976,98 @@ namespace lfs::vis {
         return loss_buffer_;
     }
 
+    void TrainerManager::updatePSNR(float psnr) {
+        std::lock_guard<std::mutex> lock(psnr_buffer_mutex_);
+        psnr_buffer_.push_back(psnr);
+        while (psnr_buffer_.size() > static_cast<size_t>(MAX_PSNR_POINTS)) {
+            psnr_buffer_.pop_front();
+        }
+    }
+
+    std::deque<float> TrainerManager::getPSNRBuffer() const {
+        std::lock_guard<std::mutex> lock(psnr_buffer_mutex_);
+        return psnr_buffer_;
+    }
+
+    void TrainerManager::updateEvaluationMetrics(int iteration, float psnr, float ssim) {
+        updatePSNR(psnr);
+        setLastPSNR(psnr);
+        std::lock_guard<std::mutex> lock(eval_metrics_mutex_);
+        last_eval_metrics_ = EvaluationMetricsSnapshot{
+            .iteration = iteration,
+            .psnr = psnr,
+            .ssim = ssim};
+    }
+
+    std::optional<TrainerManager::EvaluationMetricsSnapshot> TrainerManager::getLastEvaluationMetrics() const {
+        std::lock_guard<std::mutex> lock(eval_metrics_mutex_);
+        return last_eval_metrics_;
+    }
+
+    void TrainerManager::clearEvaluationMetrics() {
+        {
+            std::lock_guard<std::mutex> lock(psnr_buffer_mutex_);
+            psnr_buffer_.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(eval_metrics_mutex_);
+            last_eval_metrics_.reset();
+        }
+        last_psnr_.store(0.0f);
+    }
+
     void TrainerManager::trainingThreadFunc(std::stop_token stop_token) {
         LOG_INFO("Training thread started");
         LOG_TIMER("Training execution");
 
-        try {
-            LOG_DEBUG("Starting trainer->train() with stop token");
-            auto train_result = trainer_->train(stop_token);
-
-            if (!train_result) {
-                LOG_ERROR("Training failed: {}", train_result.error());
-                handleTrainingComplete(false, train_result.error());
-            } else {
-                LOG_INFO("Training completed successfully");
-                handleTrainingComplete(true);
+        trainer_->setOnIterationStart([this] {
+            if (auto* pm = services().paramsOrNull(); pm && pm->consumeDirty()) {
+                applyPendingParams();
             }
-        } catch (const std::exception& e) {
-            LOG_ERROR("Exception in training thread: {}", e.what());
-            handleTrainingComplete(false, std::format("Exception in training: {}", e.what()));
-        } catch (...) {
-            LOG_CRITICAL("Unknown exception in training thread");
-            handleTrainingComplete(false, "Unknown exception in training");
-        }
+        });
+
+        lfs::core::run_guarded<void>(
+            lfs::core::TaskContext{
+                .name = "training-worker",
+                .domain = lfs::ErrorDomain::Training,
+                .operation_id = lfs::OperationId::generate(),
+                .site = LFS_SOURCE_SITE_CURRENT(),
+            },
+            [this, stop_token]() -> lfs::Result<void> {
+                LOG_DEBUG("Starting trainer->train() with stop token");
+                return trainer_->train(stop_token);
+            },
+            [this](lfs::Result<void>&& result) {
+                if (result) {
+                    LOG_INFO("Training completed successfully");
+                    handleTrainingComplete(true);
+                } else {
+                    const auto& error = result.error();
+                    const std::string message =
+                        error.user_message().empty() ? std::string(error.detail())
+                                                     : std::string(error.user_message());
+                    LOG_ERROR("Training failed: {}", message);
+                    lfs::core::ErrorReporter::get().report(error, lfs::core::ReportChannel::OwnerLog);
+                    handleTrainingComplete(
+                        false, message,
+                        error.code() == lfs::ErrorCode::ResourceExhausted, error);
+                }
+            });
+
+        release_training_thread_local_cuda_caches();
 
         LOG_INFO("Training thread finished");
     }
 
-    void TrainerManager::handleTrainingComplete(const bool success, const std::string& error) {
+    void TrainerManager::handleTrainingComplete(const bool success, const std::string& error,
+                                                const bool resource_exhausted,
+                                                const std::optional<lfs::Error>& typed_error) {
         if (!error.empty()) {
             last_error_ = error;
             LOG_ERROR("Training error: {}", error);
+        }
+        if (typed_error) {
+            last_training_error_.set(*typed_error);
         }
 
         const float elapsed = getElapsedSeconds();
@@ -543,7 +1075,6 @@ namespace lfs::vis {
         const float final_loss = getCurrentLoss();
         const bool user_stopped = (getState() == TrainingState::Stopping);
 
-        updateResourceTracking();
         if (!user_stopped) {
             if (!state_machine_.transitionTo(TrainingState::Stopping)) {
                 LOG_WARN("Failed to transition to Stopping");
@@ -554,29 +1085,19 @@ namespace lfs::vis {
                                     : user_stopped ? FinishReason::UserStopped
                                                    : FinishReason::Completed;
 
-        if (!state_machine_.transitionToFinished(reason)) {
-            LOG_WARN("Failed to transition to Finished");
-        }
-
-        LOG_INFO("Training finished: iter={}, loss={:.6f}, time={:.1f}s",
-                 final_iter, final_loss, elapsed);
-
-        // Skip popup for user-stopped (user knows they stopped it)
-        if (!user_stopped) {
-            state::TrainingCompleted{
+        {
+            std::lock_guard lock(completion_mutex_);
+            pending_completion_ = TrainingCompletionData{
                 .iteration = final_iter,
                 .final_loss = final_loss,
                 .elapsed_seconds = elapsed,
                 .success = success,
-                .error = error.empty() ? std::nullopt : std::optional(error)}
-                .emit();
+                .user_stopped = user_stopped,
+                .resource_exhausted = resource_exhausted,
+                .reason = reason,
+                .error = error.empty() ? std::nullopt : std::optional(error),
+                .typed_error = typed_error};
         }
-
-        {
-            std::lock_guard lock(completion_mutex_);
-            training_complete_ = true;
-        }
-        completion_cv_.notify_all();
     }
 
     void TrainerManager::setupEventHandlers() {
@@ -607,6 +1128,11 @@ namespace lfs::vis {
         state::TrainingProgress::when([this](const auto& event) {
             updateLoss(event.loss);
         });
+
+        // Listen for evaluation completed events - update PSNR buffer
+        state::EvaluationCompleted::when([this](const auto& event) {
+            updateEvaluationMetrics(event.iteration, event.psnr, event.ssim);
+        });
     }
 
     std::shared_ptr<const lfs::core::Camera> TrainerManager::getCamById(int camId) const {
@@ -618,25 +1144,61 @@ namespace lfs::vis {
         return nullptr;
     }
 
-    std::vector<std::shared_ptr<const lfs::core::Camera>> TrainerManager::getCamList() const {
-        // Get cameras from Scene (Scene owns all training data)
+    std::vector<std::shared_ptr<lfs::core::Camera>> TrainerManager::getCamList() const {
         if (scene_) {
-            return scene_->getAllCameras();
+            return scene_->getActiveCameras();
         }
         LOG_ERROR("getCamList called but scene is not set");
         return {};
+    }
+
+    std::vector<std::shared_ptr<lfs::core::Camera>> TrainerManager::getAllCamList() const {
+        if (scene_) {
+            return scene_->getAllCameras();
+        }
+        return {};
+    }
+
+    std::expected<lfs::training::Trainer::CameraMetricsSnapshot, std::string>
+    TrainerManager::computeCameraMetricsForCameraId(
+        const int camera_id,
+        const bool include_ssim,
+        const lfs::training::Trainer::CameraMetricsAppearanceConfig& appearance) const {
+        std::lock_guard<std::mutex> lock(trainer_lifetime_mutex_);
+
+        if (!trainer_) {
+            return std::unexpected("trainer unavailable");
+        }
+        if (!scene_) {
+            return std::unexpected("scene unavailable");
+        }
+
+        const auto cam = scene_->getCameraByUid(camera_id);
+        if (!cam) {
+            return std::unexpected(std::format("camera {} not found", camera_id));
+        }
+
+        return trainer_->computeCameraMetrics(*cam, include_ssim, appearance);
     }
 
     void TrainerManager::applyPendingParams() {
         if (!trainer_)
             return;
 
+        if (trainer_->isInitialized() && trainer_->getParams().resume_checkpoint.has_value()) {
+            if (auto* const param_mgr = services().paramsOrNull()) {
+                param_mgr->importTrainingParams(trainer_->getParams());
+            }
+            LOG_DEBUG("Ignoring parameter updates for checkpoint-backed trainer");
+            return;
+        }
+
         auto params = trainer_->getParams();
         params.dataset = pending_dataset_params_;
 
         // Use ParameterManager in GUI mode, fallback to pending_opt_params_ for headless
         if (auto* const param_mgr = services().paramsOrNull()) {
-            params.optimization = param_mgr->getActiveParams();
+            params.optimization = param_mgr->copyActiveParams();
             LOG_DEBUG("Applied params: strategy={}, iter={}, max_cap={}",
                       params.optimization.strategy, params.optimization.iterations, params.optimization.max_cap);
         } else {

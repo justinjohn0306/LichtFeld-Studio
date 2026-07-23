@@ -4,52 +4,76 @@
 
 #pragma once
 
-#include "command/commands/composite_command.hpp"
-#include "command/commands/cropbox_command.hpp"
-#include "command/commands/ellipsoid_command.hpp"
-#include "command/commands/transform_command.hpp"
+#include "core/cuda_version.hpp"
+#include "core/error_bus.hpp"
 #include "core/events.hpp"
+#include "core/export.hpp"
 #include "core/parameters.hpp"
-#include "gui/gizmo_transform.hpp"
-#include "gui/panels/gizmo_toolbar.hpp"
+#include "core/path_utils.hpp"
+#include "gui/async_task_manager.hpp"
+#include "gui/gizmo_manager.hpp"
+#include "gui/global_context_menu.hpp"
+#include "gui/gui_error_consumer.hpp"
+#include "gui/panel_layout.hpp"
+#include "gui/panel_registry.hpp"
 #include "gui/panels/menu_bar.hpp"
-#include "gui/panels/transform_panel.hpp"
+#include "gui/rml_menu_bar.hpp"
+#include "gui/rml_modal_overlay.hpp"
+#include "gui/rml_right_panel.hpp"
+#include "gui/rml_shell_frame.hpp"
+#include "gui/rml_status_bar.hpp"
+#include "gui/rml_toast_overlay.hpp"
+#include "gui/rml_viewport_overlay.hpp"
+#include "gui/rmlui/rmlui_manager.hpp"
+#include "gui/sequencer_ui_manager.hpp"
+#include "gui/sequencer_ui_state.hpp"
+#include "gui/startup_overlay.hpp"
 #include "gui/ui_context.hpp"
 #include "gui/utils/drag_drop_native.hpp"
-#include "io/loader.hpp"
-#include "windows/disk_space_error_dialog.hpp"
-#include "windows/exit_confirmation_popup.hpp"
-#include "windows/export_dialog.hpp"
-#include "windows/notification_popup.hpp"
-#include "windows/resume_checkpoint_popup.hpp"
-#include "windows/save_directory_popup.hpp"
-#define GLFW_INCLUDE_NONE
-#include <GLFW/glfw3.h>
-#include <atomic>
+#include "rendering/cuda_vulkan_interop.hpp"
+#include "rendering/passes/vulkan_viewport_pass.hpp"
+#include "visualizer/app_store.hpp"
+#include "visualizer/gui/video_widget_interface.hpp"
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
+#include <future>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
+#include <vector>
+#include <vulkan/vulkan.h>
 #include <imgui.h>
-#include <ImGuizmo.h>
+
+struct SDL_Cursor;
 
 namespace lfs::core {
-    class SplatData;
+    class Tensor;
 }
 
 namespace lfs::vis {
     class VisualizerImpl;
+    class VulkanContext;
+    class WindowManager;
+    struct VulkanSceneInteropTarget;
 
     namespace gui {
-        class FileBrowser;
-        class ScenePanel;
-        class ProjectChangedDialogBox;
+        struct GuiHitTestResult {
+            bool blocks_pointer = false;
+            bool takes_keyboard_focus = false;
+        };
 
-        class GuiManager {
+        struct GuiInputState {
+            bool has_keyboard_focus = false;
+            bool text_input_active = false;
+            bool modal_open = false;
+        };
+
+        class LFS_VIS_API GuiManager {
         public:
             GuiManager(VisualizerImpl* viewer);
             ~GuiManager();
@@ -58,168 +82,241 @@ namespace lfs::vis {
             void init();
             void shutdown();
             void render();
+            void updateInteractiveTransitions();
+            [[nodiscard]] bool isInteractiveTransitionSettling() const;
+            void syncVisiblePanelsBeforeSceneRender();
+            void setRmlResizeDeferring(bool defer) { rmlui_manager_.setResizeDeferring(defer); }
+
+            // Sub-manager access
+            [[nodiscard]] AsyncTaskManager& asyncTasks() { return async_tasks_; }
+            [[nodiscard]] const AsyncTaskManager& asyncTasks() const { return async_tasks_; }
+            void enqueueModal(lfs::core::ModalRequest request);
+            void enqueueToast(ToastRequest request);
+            [[nodiscard]] GizmoManager& gizmo() { return gizmo_manager_; }
+            [[nodiscard]] const GizmoManager& gizmo() const { return gizmo_manager_; }
+            [[nodiscard]] PanelLayoutManager& panelLayout() { return panel_layout_; }
+            [[nodiscard]] const PanelLayoutManager& panelLayout() const { return panel_layout_; }
+            [[nodiscard]] GlobalContextMenu& globalContextMenu() { return *global_context_menu_; }
 
             // State queries
-            bool wantsInput() const;
-            bool isAnyWindowActive() const;
+            bool needsAnimationFrame() const;
+            [[nodiscard]] bool isViewportExportLocked() const;
 
             // Window visibility
             void showWindow(const std::string& name, bool show = true);
-            void toggleWindow(const std::string& name);
-
-            void setFileSelectedCallback(std::function<void(const std::filesystem::path&, bool)> callback);
 
             // Viewport region access
-            ImVec2 getViewportPos() const;
-            ImVec2 getViewportSize() const;
-            bool isMouseInViewport() const;
+            glm::vec2 getViewportPos() const;
+            glm::vec2 getViewportSize() const;
             bool isViewportFocused() const;
             bool isPositionInViewport(double x, double y) const;
-            bool isViewportGizmoDragging() const { return viewport_gizmo_dragging_; }
-            bool isResizingPanel() const { return resizing_panel_ || hovering_panel_edge_; }
-            bool isPositionInViewportGizmo(double x, double y) const;
-
-            // Selection sub-mode shortcuts (Ctrl+1..5)
-            void setSelectionSubMode(panels::SelectionSubMode mode);
-            panels::SelectionSubMode getSelectionSubMode() const { return gizmo_toolbar_state_.selection_mode; }
-            panels::ToolType getCurrentToolMode() const; // Delegates to EditorContext
-            const panels::GizmoToolbarState& getGizmoToolbarState() const { return gizmo_toolbar_state_; }
-            panels::TransformPanelState& getTransformPanelState() { return transform_panel_state_; }
-
-            // Gizmo manipulation state (for wireframe sync)
-            bool isCropboxGizmoActive() const { return cropbox_gizmo_active_; }
-            bool isEllipsoidGizmoActive() const { return ellipsoid_gizmo_active_; }
+            bool isPositionOverFloatingPanel(double x, double y) const;
+            [[nodiscard]] GuiHitTestResult hitTestPointer(double x, double y) const;
+            [[nodiscard]] GuiInputState inputState() const;
 
             bool isForceExit() const { return force_exit_; }
+            void setForceExit(bool value) { force_exit_ = value; }
 
-            // Exit confirmation
+            [[nodiscard]] SequencerController& sequencer() { return sequencer_ui_.controller(); }
+            [[nodiscard]] const SequencerController& sequencer() const { return sequencer_ui_.controller(); }
+            [[nodiscard]] SequencerUIManager& sequencerUI() { return sequencer_ui_; }
+            [[nodiscard]] const SequencerUIManager& sequencerUI() const { return sequencer_ui_; }
+
+            [[nodiscard]] panels::SequencerUIState& getSequencerUIState() { return sequencer_ui_state_; }
+            [[nodiscard]] const panels::SequencerUIState& getSequencerUIState() const { return sequencer_ui_state_; }
+
+            [[nodiscard]] VisualizerImpl* getViewer() const { return viewer_; }
+            [[nodiscard]] std::unordered_map<std::string, bool>* getWindowStates() { return &window_states_; }
+
             void requestExitConfirmation();
             bool isExitConfirmationPending() const;
 
-            // Input capture for key rebinding
             bool isCapturingInput() const;
             bool isModalWindowOpen() const;
-            void captureKey(int key, int mods);
-            void captureMouseButton(int button, int mods);
+            [[nodiscard]] bool passiveMouseMoveNeedsRender(float mouse_x, float mouse_y) const;
+            [[nodiscard]] std::optional<double> secondsUntilTooltipReveal() const;
+            [[nodiscard]] bool isStartupVisible() const { return startup_overlay_.isVisible(); }
+            [[nodiscard]] bool isStartupBlockingInput() const {
+                return startup_overlay_.blocksUnderlayInput();
+            }
+            void dismissStartupOverlay();
+            void setStartupPluginLoadState(bool started, bool active, float progress,
+                                           const std::string& stage);
+            void captureKey(int physical_key, int logical_key, int mods);
+            void captureMouseButton(int button, int mods, double x, double y, std::optional<int> chord_key = std::nullopt);
+            void captureMouseButtonRelease(int button);
+            void captureMouseMove(double x, double y);
+
+            // Thumbnail system (delegates to MenuBar)
+            void requestThumbnail(const std::string& video_id);
+            void processThumbnails();
+            bool isThumbnailReady(const std::string& video_id) const;
+            uint64_t getThumbnailTexture(const std::string& video_id) const;
+
+            int getHighlightedCameraUid() const;
+
+            // Drag-drop state for overlays
+            [[nodiscard]] bool isDragHovering() const { return drag_drop_hovering_; }
+            void setVulkanSceneImage(std::shared_ptr<const lfs::core::Tensor> image,
+                                     glm::ivec2 size,
+                                     bool flip_y,
+                                     std::uint64_t generation,
+                                     VkSemaphore completion_semaphore = VK_NULL_HANDLE,
+                                     std::uint64_t completion_value = 0);
+            void setVulkanExternalSceneImage(VkImage image,
+                                             VkImageView image_view,
+                                             VkImageLayout layout,
+                                             glm::ivec2 size,
+                                             bool flip_y,
+                                             std::uint64_t generation,
+                                             VkSemaphore completion_semaphore = VK_NULL_HANDLE,
+                                             std::uint64_t completion_value = 0);
+
+            // Split-view's right panel routes through a parallel CUDA/Vulkan interop
+            // slot so we don't pay PCIe staging cost for it; the left panel reuses the
+            // existing scene image interop above.
+            void setVulkanSplitRightImage(std::shared_ptr<const lfs::core::Tensor> image,
+                                          glm::ivec2 size,
+                                          bool flip_y,
+                                          std::uint64_t generation);
+            void clearVulkanSplitRightImage();
+
+            // Splat depth -> R32_SFLOAT external image for the depth-blit pass to sample.
+            void setVulkanDepthBlitImage(std::shared_ptr<const lfs::core::Tensor> depth,
+                                         glm::ivec2 size,
+                                         std::uint64_t generation);
+            void clearVulkanDepthBlitImage();
+
+            // Used by native panel wrappers
+            void renderSelectionOverlays(const UIContext& ctx);
+            void renderViewportDecorations();
 
         private:
+            [[nodiscard]] VulkanViewportPassParams buildVulkanViewportParams(VkExtent2D extent,
+                                                                             std::size_t frame_slot) const;
+            void recordVulkanViewport(VkCommandBuffer command_buffer,
+                                      VkExtent2D extent,
+                                      const VulkanViewportPassParams& params);
+            void prepareVulkanSceneInterop(VulkanContext& context);
+            void resetVulkanSceneInterop();
+            void prepareVulkanSplitRightInterop(VulkanContext& context);
+            void resetVulkanSplitRightInterop();
+            void prepareVulkanDepthBlitInterop(VulkanContext& context);
+            void resetVulkanDepthBlitInterop();
+            [[nodiscard]] bool shouldDeferVulkanInteropResize() const;
             void setupEventHandlers();
             void checkCudaVersionAndNotify();
             void applyDefaultStyle();
-            void updateViewportRegion();
-            void updateViewportFocus();
             void initMenuBar();
+            void registerNativePanels();
+            void updateInputOverrides(const PanelInputState& input, bool mouse_in_viewport);
+            void applyUiScale(float scale);
+            void rebuildFonts(float scale);
+            void loadImGuiSettings();
+            void saveImGuiSettings() const;
+            void persistImGuiSettingsIfNeeded();
+            void beginImGuiPlatformFrame(WindowManager* window_manager,
+                                         VulkanContext* vulkan_context);
+            [[nodiscard]] bool shouldUseCachedImGuiResizeFrame(
+                const WindowManager* window_manager,
+                const VulkanContext* vulkan_context) const;
+            void initCustomCursors();
+            void destroyCustomCursors();
+            void applyRmlCursorRequest(RmlCursorRequest req);
+            struct DevResourceScanResult {
+                std::unordered_map<std::string, std::filesystem::file_time_type> file_times;
+                bool rml_changed = false;
+                bool locale_changed = false;
+                bool scan_failed = false;
+            };
+            void initDevResourceHotReload();
+            void pollDevResourceHotReload();
+            DevResourceScanResult scanDevResourceFiles(bool detect_changes);
+            static DevResourceScanResult scanDevResourceFilesSnapshot(
+                std::filesystem::path rml_dir,
+                std::filesystem::path locale_dir,
+                std::unordered_map<std::string, std::filesystem::file_time_type> previous_times,
+                bool detect_changes);
+            void launchDevResourceScan();
+            bool consumeDevResourceScanResult();
+            bool shouldDeferDevResourceHotReload() const;
+            bool reloadLocalizationResources();
+            void reloadRmlResources();
+
+            [[nodiscard]] bool isVramHudOverlayVisible() const;
+            [[nodiscard]] bool isVramHudPublishDue(std::chrono::steady_clock::time_point now) const;
+            [[nodiscard]] bool drainVulkanFramesForInteractiveTransition(
+                lfs::vis::WindowManager& window_manager,
+                const char* transition_name);
+            void applyInteractiveTransitionCooldown(
+                std::chrono::steady_clock::time_point& next_allowed_at,
+                std::chrono::steady_clock::time_point now,
+                bool training_active);
+            void queueUiVisibilityToggle();
+            void requestUiVisibilityToggle();
+            void updateUiVisibilityTransition();
+            void queueFullscreenToggle();
+            void requestFullscreenToggle();
+            void updateFullscreenTransition();
+            void beginInteractiveTransitionGuard();
+            void updateInteractiveTransitionGuard();
+            void endInteractiveTransitionGuard();
+
+            struct EditorContextUpdateStamp {
+                bool valid = false;
+                bool has_scene_manager = false;
+                bool has_trainer_manager = false;
+                bool has_dataset = false;
+                bool has_training_model = false;
+                bool trainer_running = false;
+                bool trainer_paused = false;
+                bool trainer_finished = false;
+                std::uint64_t scene_generation = 0;
+                std::uint64_t selection_generation = 0;
+                std::uint64_t scene_node_count = 0;
+
+                bool operator==(const EditorContextUpdateStamp&) const = default;
+            };
 
             // Core dependencies
             VisualizerImpl* viewer_;
 
             // Owned components
-            std::unique_ptr<FileBrowser> file_browser_;
-            std::unique_ptr<ScenePanel> scene_panel_;
-            std::unique_ptr<ExportDialog> export_dialog_;
-            std::unique_ptr<NotificationPopup> notification_popup_;
-            std::unique_ptr<SaveDirectoryPopup> save_directory_popup_;
-            std::unique_ptr<ResumeCheckpointPopup> resume_checkpoint_popup_;
-            std::unique_ptr<ExitConfirmationPopup> exit_confirmation_popup_;
-            std::unique_ptr<DiskSpaceErrorDialog> disk_space_error_dialog_;
+            std::unique_ptr<RmlModalOverlay> rml_modal_overlay_;
+            std::unique_ptr<RmlToastOverlay> rml_toast_overlay_;
+            std::unique_ptr<lfs::gui::IVideoExtractorWidget> video_widget_;
 
             // UI state only
             std::unordered_map<std::string, bool> window_states_;
             bool show_main_panel_ = true;
-            bool show_viewport_gizmo_ = true;
+            bool show_vram_hud_ = true;
+            bool vram_hud_visible_published_ = false;
+            std::chrono::steady_clock::time_point next_vram_hud_publish_{};
+            std::chrono::steady_clock::time_point ui_toggle_next_allowed_at_{};
+            bool ui_toggle_pending_ = false;
+            std::chrono::steady_clock::time_point fullscreen_toggle_next_allowed_at_{};
+            std::chrono::steady_clock::time_point interactive_transition_guard_until_{};
+            bool fullscreen_toggle_pending_ = false;
+            bool fullscreen_target_state_ = false;
+            bool interactive_transition_resume_training_ = false;
+            std::optional<AppStore::GTMetricsOverlayConfig> published_gt_metrics_overlay_config_;
+            bool menu_labels_synced_ = false;
+            std::uint64_t synced_menu_entries_version_ = 0;
+            std::uint64_t synced_menu_language_generation_ = 0;
 
-            // Speed overlay state
-            bool speed_overlay_visible_ = false;
-            std::chrono::steady_clock::time_point speed_overlay_start_time_;
-            std::chrono::milliseconds speed_overlay_duration_;
-            float current_speed_ = 0.0f;
-
-            // Zoom speed overlay state
-            bool zoom_speed_overlay_visible_ = false;
-            std::chrono::steady_clock::time_point zoom_speed_overlay_start_time_;
-            float zoom_speed_ = 5.0f;
-
-            // Viewport region tracking
-            ImVec2 viewport_pos_;
-            ImVec2 viewport_size_;
-            bool viewport_has_focus_;
+            // Panel layout and viewport
+            PanelLayoutManager panel_layout_;
+            ViewportLayout viewport_layout_;
+            float menu_toolbar_right_edge_ = 0.0f;
             bool force_exit_ = false;
 
-            // Right panel state
-            float right_panel_width_ = 300.0f;
-            float scene_panel_ratio_ = 0.4f;
-            bool resizing_panel_ = false;
-            bool hovering_panel_edge_ = false;
-            static constexpr float RIGHT_PANEL_MIN_RATIO = 0.01f;
-            static constexpr float RIGHT_PANEL_MAX_RATIO = 0.99f;
-
-            // Viewport gizmo layout (must match ViewportGizmo settings)
-            static constexpr float VIEWPORT_GIZMO_SIZE = 95.0f;
-            static constexpr float VIEWPORT_GIZMO_MARGIN_X = 10.0f;
-            static constexpr float VIEWPORT_GIZMO_MARGIN_Y = 10.0f;
-
-            // Status bar layout
-            static constexpr float STATUS_BAR_HEIGHT = 22.0f;
-
-            // Method declarations
-            void renderStatusBar(const UIContext& ctx);
-            void showSpeedOverlay(float current_speed, float max_speed);
-            void showZoomSpeedOverlay(float zoom_speed, float max_zoom_speed);
-            void renderCropBoxGizmo(const UIContext& ctx);
-            void renderEllipsoidGizmo(const UIContext& ctx);
-            void renderCropGizmoMiniToolbar(const UIContext& ctx);
-            void renderNodeTransformGizmo(const UIContext& ctx);
-
             std::unique_ptr<MenuBar> menu_bar_;
-            bool menu_bar_input_bindings_set_ = false;
 
-            // Node transform gizmo state
-            bool show_node_gizmo_ = true;
-            ImGuizmo::OPERATION node_gizmo_operation_ = ImGuizmo::TRANSLATE;
+            panels::SequencerUIState sequencer_ui_state_;
+            SequencerUIManager sequencer_ui_;
+            GizmoManager gizmo_manager_;
 
-            // Gizmo toolbar state
-            panels::GizmoToolbarState gizmo_toolbar_state_;
-            panels::TransformPanelState transform_panel_state_;
-
-            // Unified gizmo context for cropbox/ellipsoid
-            GizmoTransformContext gizmo_context_;
-
-            // Cropbox undo/redo state
-            bool cropbox_gizmo_active_ = false;
-            std::string cropbox_node_name_;
-            std::optional<command::CropBoxState> cropbox_state_before_drag_;
-
-            // Ellipsoid undo/redo state
-            bool ellipsoid_gizmo_active_ = false;
-            std::string ellipsoid_node_name_;
-            std::optional<command::EllipsoidState> ellipsoid_state_before_drag_;
-
-            // Node transform undo/redo state (supports multi-selection)
-            bool node_gizmo_active_ = false;
-            std::vector<std::string> node_gizmo_node_names_;
-            std::vector<glm::mat4> node_transforms_before_drag_;
-            std::vector<glm::vec3> node_original_world_positions_;
-            std::vector<glm::mat4> node_parent_world_inverses_;
-            std::vector<glm::mat3> node_original_rotations_;
-            std::vector<glm::vec3> node_original_scales_;
-            glm::vec3 gizmo_pivot_{0.0f};
-            glm::mat3 gizmo_cumulative_rotation_{1.0f};
-            glm::vec3 gizmo_cumulative_scale_{1.0f};
-
-            // Previous tool/selection mode for detecting changes
-            panels::ToolType previous_tool_ = panels::ToolType::None;
-            panels::SelectionSubMode previous_selection_mode_ = panels::SelectionSubMode::Centers;
-
-            // Tool cleanup
-            void deactivateAllTools();
-
-            // Crop box flash effect
-            std::chrono::steady_clock::time_point crop_flash_start_;
-            bool crop_flash_active_ = false;
-            void triggerCropFlash();
-            void updateCropFlash();
-
-            bool focus_training_panel_ = false;
+            std::string focus_panel_name_;
             bool ui_hidden_ = false;
 
             // Font storage
@@ -228,74 +325,138 @@ namespace lfs::vis {
             ImFont* font_heading_ = nullptr;
             ImFont* font_small_ = nullptr;
             ImFont* font_section_ = nullptr;
+            ImFont* font_monospace_ = nullptr;
+            ImFont* mono_fonts_[FontSet::MONO_SIZE_COUNT] = {};
+            float mono_font_scales_[FontSet::MONO_SIZE_COUNT] = {};
+            std::filesystem::path imgui_ini_path_;
+            FontSet buildFontSet() const;
 
-            // Viewport gizmo drag-to-orbit state
-            bool viewport_gizmo_dragging_ = false;
-            glm::dvec2 gizmo_drag_start_cursor_{0.0, 0.0};
+            // Async task management
+            AsyncTaskManager async_tasks_;
 
-            // Async export state
-            struct ExportState {
-                std::atomic<bool> active{false};
-                std::atomic<bool> cancel_requested{false};
-                std::atomic<float> progress{0.0f};
-                lfs::core::ExportFormat format{lfs::core::ExportFormat::PLY}; // Protected by mutex
-                std::string stage;                                            // Protected by mutex
-                std::string error;                                            // Protected by mutex
-                std::mutex mutex;
-                std::unique_ptr<std::jthread> thread;
-            };
-            ExportState export_state_;
-
-            // Async dataset import state
-            struct ImportState {
-                std::atomic<bool> active{false};
-                std::atomic<bool> show_completion{false};
-                std::atomic<bool> load_complete{false};
-                std::atomic<float> progress{0.0f};
-                std::mutex mutex;
-                // Protected by mutex:
-                std::filesystem::path path;
-                std::string stage;
-                std::string dataset_type;
-                std::string error;
-                size_t num_images{0};
-                size_t num_points{0};
-                bool success{false};
-                std::chrono::steady_clock::time_point completion_time;
-                std::optional<lfs::io::LoadResult> load_result;
-                lfs::core::param::TrainingParameters params;
-                std::unique_ptr<std::jthread> thread;
-            };
-            ImportState import_state_;
-
-            void startAsyncImport(const std::filesystem::path& path,
-                                  const lfs::core::param::TrainingParameters& params);
-            void checkAsyncImportCompletion();
-            void applyLoadedDataToScene();
-
-            void renderExportOverlay();
-            void renderImportOverlay();
-            void renderEmptyStateOverlay();
-            void renderDragDropOverlay();
-            void renderStartupOverlay();
-
-            // Startup overlay state
-            bool show_startup_overlay_ = true;
-            unsigned int startup_logo_light_texture_ = 0;
-            unsigned int startup_logo_dark_texture_ = 0;
-            unsigned int startup_core11_light_texture_ = 0;
-            unsigned int startup_core11_dark_texture_ = 0;
-            int startup_logo_width_ = 0, startup_logo_height_ = 0;
-            int startup_core11_width_ = 0, startup_core11_height_ = 0;
-            void startAsyncExport(lfs::core::ExportFormat format,
-                                  const std::filesystem::path& path,
-                                  std::unique_ptr<lfs::core::SplatData> data);
-            void cancelExport();
-            bool isExporting() const { return export_state_.active.load(); }
+            StartupOverlay startup_overlay_;
+            RmlShellFrame rml_shell_frame_;
+            RmlRightPanel rml_right_panel_;
+            RmlViewportOverlay rml_viewport_overlay_;
+            RmlMenuBar rml_menu_bar_;
+            RmlStatusBar rml_status_bar_;
+            std::unique_ptr<GlobalContextMenu> global_context_menu_;
 
             // Native drag-drop handler
             NativeDragDrop drag_drop_;
             bool drag_drop_hovering_ = false;
+
+            // DPI scaling
+            float current_ui_scale_ = 1.0f;
+            float pending_ui_scale_ = 0.0f;
+
+            // Deferred CUDA version warning (emitted on first drawFrame)
+            std::optional<lfs::core::CudaVersionInfo> pending_cuda_warning_;
+            bool cuda_unavailable_notified_ = false;
+
+            // File association prompt (Windows only, one-shot)
+            bool file_association_checked_ = false;
+            void promptFileAssociation();
+
+            // RmlUI integration
+            RmlUIManager rmlui_manager_;
+            std::chrono::steady_clock::time_point last_imgui_platform_frame_time_{};
+            std::uint64_t cached_imgui_resize_frame_count_ = 0;
+            bool used_cached_imgui_resize_frame_ = false;
+            std::unique_ptr<lfs::vis::VulkanViewportPass> vulkan_viewport_pass_;
+            lfs::rendering::CudaVulkanUploadStream vulkan_interop_upload_stream_;
+            std::vector<std::unique_ptr<VulkanSceneInteropTarget>> vulkan_scene_interop_;
+            std::shared_ptr<const lfs::core::Tensor> vulkan_scene_image_;
+            std::uint64_t vulkan_scene_image_generation_ = 0;
+            glm::ivec2 vulkan_scene_image_size_{0, 0};
+            bool vulkan_scene_image_flip_y_ = false;
+            VkImage vulkan_external_scene_image_ = VK_NULL_HANDLE;
+            VkImageView vulkan_external_scene_image_view_ = VK_NULL_HANDLE;
+            VkImageLayout vulkan_external_scene_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+            glm::ivec2 vulkan_external_scene_image_size_{0, 0};
+            bool vulkan_external_scene_image_flip_y_ = false;
+            std::uint64_t vulkan_external_scene_image_generation_ = 0;
+            VkSemaphore vulkan_frame_completion_semaphore_ = VK_NULL_HANDLE;
+            std::uint64_t vulkan_frame_completion_value_ = 0;
+            bool vulkan_scene_interop_disabled_ = false;
+
+            // Parallel slot for split-view's right panel.
+            std::vector<std::unique_ptr<VulkanSceneInteropTarget>> vulkan_split_right_interop_;
+            std::shared_ptr<const lfs::core::Tensor> vulkan_split_right_image_;
+            std::uint64_t vulkan_split_right_image_generation_ = 0;
+            glm::ivec2 vulkan_split_right_image_size_{0, 0};
+            bool vulkan_split_right_image_flip_y_ = false;
+            VkImage vulkan_split_right_external_image_ = VK_NULL_HANDLE;
+            VkImageView vulkan_split_right_external_image_view_ = VK_NULL_HANDLE;
+            VkImageLayout vulkan_split_right_external_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+            std::uint64_t vulkan_split_right_external_image_generation_ = 0;
+            bool vulkan_split_right_interop_disabled_ = false;
+
+            // R32_SFLOAT slot for splat depth (consumed by VulkanDepthBlitPass).
+            std::vector<std::unique_ptr<VulkanSceneInteropTarget>> vulkan_depth_blit_interop_;
+            std::shared_ptr<const lfs::core::Tensor> vulkan_depth_blit_image_;
+            std::uint64_t vulkan_depth_blit_image_generation_ = 0;
+            glm::ivec2 vulkan_depth_blit_image_size_{0, 0};
+            VkImage vulkan_depth_blit_external_image_ = VK_NULL_HANDLE;
+            VkImageView vulkan_depth_blit_external_image_view_ = VK_NULL_HANDLE;
+            VkImageLayout vulkan_depth_blit_external_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+            std::uint64_t vulkan_depth_blit_external_image_generation_ = 0;
+            bool vulkan_depth_blit_interop_disabled_ = false;
+            bool vulkan_gui_ = false;
+            SDL_Cursor* pipette_cursor_ = nullptr;
+
+            // Native panel wrapper storage (registered with PanelRegistry)
+            std::vector<std::shared_ptr<IPanel>> native_panel_storage_;
+            uint64_t panel_frame_serial_ = 0;
+            uint8_t ui_layout_settle_frames_ = 0;
+            EditorContextUpdateStamp last_editor_context_update_stamp_;
+            glm::vec2 last_ui_layout_work_pos_{-1.0f, -1.0f};
+            glm::vec2 last_ui_layout_work_size_{-1.0f, -1.0f};
+            float last_ui_layout_right_panel_w_ = -1.0f;
+            float last_ui_layout_scene_ratio_ = -1.0f;
+            float last_ui_layout_python_console_w_ = -1.0f;
+            float last_ui_layout_bottom_dock_h_ = -1.0f;
+            float last_ui_layout_left_dock_w_ = -1.0f;
+            bool last_ui_layout_show_main_panel_ = false;
+            bool last_ui_layout_ui_hidden_ = false;
+            bool last_ui_layout_python_console_visible_ = false;
+            bool last_ui_layout_bottom_dock_visible_ = false;
+            bool last_ui_layout_left_dock_visible_ = false;
+            enum class RightPanelPointerRegion : uint8_t {
+                None,
+                Resize,
+                SceneHeader,
+                ActiveTab,
+                Chrome,
+            };
+            bool right_panel_pointer_live_capture_ = false;
+            RightPanelPointerRegion right_panel_pointer_capture_region_ =
+                RightPanelPointerRegion::None;
+            bool bottom_dock_pointer_live_capture_ = false;
+            bool left_dock_pointer_live_capture_ = false;
+            bool dock_resize_interaction_active_ = false;
+            std::string last_ui_layout_active_tab_;
+            std::uint64_t last_pre_scene_panel_sync_generation_ = 0;
+
+            struct DevResourceWatchState {
+                bool enabled = false;
+                std::filesystem::path rml_dir;
+                std::filesystem::path locale_dir;
+                std::unordered_map<std::string, std::filesystem::file_time_type> file_times;
+                std::chrono::steady_clock::time_point next_scan{};
+                std::future<DevResourceScanResult> scan_future;
+                bool pending_rml_reload = false;
+                bool pending_locale_reload = false;
+            };
+
+            DevResourceWatchState dev_resource_watch_;
+
+            // Native ErrorBus surfacing (Phase 8). Declared last so
+            // error_subscription_ unsubscribes before any other member (the
+            // modal overlay included) is torn down; error_consumer_ outlives
+            // its subscription per the frozen lifetime rule.
+            std::unique_ptr<GuiErrorConsumer> error_consumer_;
+            lfs::Subscription error_subscription_;
         };
     } // namespace gui
 } // namespace lfs::vis

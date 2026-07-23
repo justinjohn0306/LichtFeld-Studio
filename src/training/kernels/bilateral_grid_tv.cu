@@ -2,10 +2,13 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "core/cuda_error.hpp"
 #include "lfs/core/memory_ops.cuh"
 #include "lfs/core/warp_reduce.cuh"
 #include "lfs/kernels/bilateral_grid.cuh"
 #include <cuda_runtime.h>
+
+#include "kernel_stream.hpp"
 
 namespace lfs::training::kernels {
 
@@ -181,6 +184,7 @@ namespace lfs::training::kernels {
         float* temp_buffer,
         int N, int L, int H, int W,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
 
         const int threads = 256;
         const int total = N * L * H * W;
@@ -189,10 +193,12 @@ namespace lfs::training::kernels {
         // Stage 1: Each block reduces to a partial sum (NO ATOMICS!)
         bilateral_grid_tv_forward_stage1_kernel<<<num_blocks, threads, 0, stream>>>(
             grids, temp_buffer, N, L, H, W);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.bilateral.tv_forward_stage1");
 
         // Stage 2: Single block aggregates partial sums (DETERMINISTIC!)
         bilateral_grid_tv_forward_stage2_kernel<<<1, threads, 0, stream>>>(
             temp_buffer, tv_loss, num_blocks);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.bilateral.tv_forward_stage2");
     }
 
     void launch_bilateral_grid_tv_backward(
@@ -201,6 +207,7 @@ namespace lfs::training::kernels {
         float* grad_grids,
         int N, int L, int H, int W,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
 
         // 3D grid for better thread organization
         dim3 block(4, 4, 4);
@@ -211,6 +218,7 @@ namespace lfs::training::kernels {
 
         bilateral_grid_tv_backward_kernel<<<grid_dim, block, 0, stream>>>(
             grids, grad_output, grad_grids, N, L, H, W);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.bilateral.tv_backward");
     }
 
 } // namespace lfs::training::kernels

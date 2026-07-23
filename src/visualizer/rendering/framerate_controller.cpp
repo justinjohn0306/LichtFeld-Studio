@@ -39,24 +39,25 @@ namespace lfs::vis {
 
         // Don't skip if scene changed - user interaction requires immediate response
         if (scene_changed) {
+            consecutive_skips_ = 0;
             return false;
         }
 
         // when not training - skip if we're in static mode and scene hasn't changed
         if (settings_.skip_when_static && !is_training) {
+            consecutive_skips_ = 0;
             return true;
         }
 
-        // Skip if performance is critical and we haven't been skipping too many frames
-        if (settings_.adaptive_quality && is_performance_critical_ &&
-            consecutive_skips_ < max_consecutive_skips_) {
-            consecutive_skips_++;
-            // reset consecutive_skips_ counter
-            if (consecutive_skips_ > max_consecutive_skips_) {
-                consecutive_skips_ = 0;
-            } else {
+        // Skip at most max_consecutive_skips_ frames, then force one render.
+        if (settings_.adaptive_quality && is_performance_critical_) {
+            if (consecutive_skips_ < max_consecutive_skips_) {
+                ++consecutive_skips_;
                 return true;
             }
+            consecutive_skips_ = 0;
+        } else {
+            consecutive_skips_ = 0;
         }
         // if training - refresh rate should correspond to training_frame_refresh_time_sec_
         if (is_training) {
@@ -100,20 +101,17 @@ namespace lfs::vis {
             return;
         }
 
-        // Current FPS from last frame
+        auto now = std::chrono::high_resolution_clock::now();
+        float since_last = std::chrono::duration<float>(now - frame_times_.back().timestamp).count();
+
         if (frame_times_.back().duration > 0.0f) {
-            current_fps_ = 1.0f / frame_times_.back().duration;
+            current_fps_ = 1.0f / std::max(frame_times_.back().duration, since_last);
         }
 
-        // Average FPS from recent frames
-        if (frame_times_.size() >= 5) { // Need at least 5 samples for meaningful average
-            float sum = 0.0f;
-            for (const auto& frame_data : frame_times_) {
-                sum += frame_data.duration;
-            }
-            float avg_frame_time = sum / frame_times_.size();
-            if (avg_frame_time > 0.0f) {
-                average_fps_ = 1.0f / avg_frame_time;
+        if (frame_times_.size() >= 5) {
+            float span = std::chrono::duration<float>(now - frame_times_.front().timestamp).count();
+            if (span > 0.0f) {
+                average_fps_ = static_cast<float>(frame_times_.size()) / span;
             }
         } else {
             average_fps_ = current_fps_;

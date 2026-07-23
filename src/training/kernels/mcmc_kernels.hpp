@@ -10,15 +10,23 @@
 namespace lfs::training::mcmc {
 
     /**
+     * Initialize relocation coefficients in __constant__ memory.
+     * Must be called once before first use of launch_relocation_kernel.
+     * Pre-computes C(n,k) * (-1)^k * rsqrt(k+1) for all n,k < n_max.
+     *
+     * @param n_max - Maximum ratio value (must be <= 51)
+     */
+    void init_relocation_coefficients(int n_max);
+
+    /**
      * Relocation kernel - Equation (9) from "3D Gaussian Splatting as Markov Chain Monte Carlo"
      *
      * Computes new opacities and scales for relocated Gaussians based on their sampling ratios.
+     * Requires init_relocation_coefficients() to have been called first.
      *
      * @param opacities [N] - Original opacity values
      * @param scales [N, 3] - Original scale values
      * @param ratios [N] - Number of times each Gaussian was sampled (int32)
-     * @param binoms [n_max, n_max] - Precomputed binomial coefficients
-     * @param n_max - Maximum ratio value (size of binomial table)
      * @param new_opacities [N] - Output: relocated opacity values
      * @param new_scales [N, 3] - Output: relocated scale values
      * @param N - Number of Gaussians
@@ -28,8 +36,7 @@ namespace lfs::training::mcmc {
         const float* opacities,
         const float* scales,
         const int32_t* ratios,
-        const float* binoms,
-        int n_max,
+        float min_opacity,
         float* new_opacities,
         float* new_scales,
         size_t N,
@@ -46,6 +53,8 @@ namespace lfs::training::mcmc {
      * @param raw_quats [N, 4] - Raw quaternion rotation values
      * @param noise [N, 3] - Random noise from N(0,1)
      * @param means [N, 3] - Mean positions (modified in-place)
+     * @param frozen_mask [N] - Optional mask of rows that must not be modified
+     * @param frozen_mask_size - Number of entries in frozen_mask
      * @param current_lr - Current learning rate for noise scaling
      * @param N - Number of Gaussians
      * @param stream - CUDA stream for async execution
@@ -56,6 +65,8 @@ namespace lfs::training::mcmc {
         const float* raw_quats,
         const float* noise,
         float* means,
+        const bool* frozen_mask,
+        size_t frozen_mask_size,
         float current_lr,
         size_t N,
         void* stream = nullptr);
@@ -266,11 +277,10 @@ namespace lfs::training::mcmc {
         void* stream = nullptr);
 
     /**
-     * Fused multinomial sampling + gather kernel (ZERO intermediate allocations)
+     * Fused multinomial sampling + gather kernel (no intermediate allocations)
      *
-     * Performs multinomial sampling from opacities[alive_indices] and directly gathers
-     * the sampled opacities and scales, all in a single kernel launch with no intermediate
-     * allocations.
+     * Performs multinomial sampling from sampling_weights[alive_indices] and directly gathers
+     * the sampled opacities and scales in a single kernel launch.
      *
      * Algorithm:
      * 1. Thread block cooperatively computes cumulative sum of probabilities
@@ -278,7 +288,8 @@ namespace lfs::training::mcmc {
      * 3. Maps local indices → global indices (alive_indices[local_idx])
      * 4. Directly gathers opacities and scales at sampled indices
      *
-     * @param opacities [N] - Source opacities (full array)
+     * @param sampling_weights [N] - Sampling probabilities (full array)
+     * @param opacities [N] - Source opacities used for relocation math
      * @param scaling_raw [N, 3] - Source raw scales (exp() applied inline)
      * @param alive_indices [n_alive] - Indices of alive Gaussians
      * @param n_alive - Number of alive Gaussians
@@ -291,6 +302,7 @@ namespace lfs::training::mcmc {
      * @param stream - CUDA stream
      */
     void launch_multinomial_sample_and_gather(
+        const float* sampling_weights,
         const float* opacities,
         const float* scaling_raw,
         const int64_t* alive_indices,
@@ -304,12 +316,13 @@ namespace lfs::training::mcmc {
         void* stream = nullptr);
 
     /**
-     * Fused multinomial sampling from ALL opacities (ZERO intermediate allocations)
+     * Fused multinomial sampling from all sampling weights (no intermediate allocations)
      *
-     * Variant that samples from all N opacities (not just a subset).
+     * Variant that samples from all N weights (not just a subset).
      * Used in add_new_gs() where we sample from the full population.
      *
-     * @param opacities [N] - Source opacities (full array)
+     * @param sampling_weights [N] - Sampling probabilities (full array)
+     * @param opacities [N] - Source opacities used for relocation math
      * @param scaling_raw [N, 3] - Source raw scales (exp() applied inline)
      * @param N - Number of Gaussians
      * @param n_samples - Number of samples to draw
@@ -320,6 +333,7 @@ namespace lfs::training::mcmc {
      * @param stream - CUDA stream
      */
     void launch_multinomial_sample_all(
+        const float* sampling_weights,
         const float* opacities,
         const float* scaling_raw,
         size_t N,
@@ -348,30 +362,19 @@ namespace lfs::training::mcmc {
         void* stream = nullptr);
 
     /**
-     * Fused dead mask computation (ZERO intermediate allocations)
+     * In-place element-wise maximum: a[i] = max(a[i], b[i])
      *
-     * Directly computes boolean dead mask from opacities and rotations in a single pass.
-     * Replaces the two-step process of:
-     *   1. Computing rot_mag_sq = (rotation * rotation).sum(-1)  [creates [N] intermediate]
-     *   2. Computing dead_mask = (opacity <= min_opacity).logical_or(rot_mag_sq < 1e-8f)
+     * Replaces allocating maximum() call that creates a new tensor every iteration.
      *
-     * Dead Gaussians are those with:
-     *   - opacity <= min_opacity OR
-     *   - ||rotation||^2 < 1e-8 (near-zero rotation magnitude)
-     *
-     * @param opacities [N] - Opacity values
-     * @param rotations [N, 4] - Quaternion rotations
-     * @param dead_mask [N] - Output: boolean mask (uint8_t)
-     * @param N - Number of Gaussians
-     * @param min_opacity - Minimum valid opacity threshold
+     * @param a [N] - First tensor, modified in-place
+     * @param b [N] - Second tensor
+     * @param N - Number of elements
      * @param stream - CUDA stream
      */
-    void launch_compute_dead_mask(
-        const float* opacities,
-        const float* rotations,
-        uint8_t* dead_mask,
+    void launch_elementwise_max_inplace(
+        float* a,
+        const float* b,
         size_t N,
-        float min_opacity,
         void* stream = nullptr);
 
 } // namespace lfs::training::mcmc

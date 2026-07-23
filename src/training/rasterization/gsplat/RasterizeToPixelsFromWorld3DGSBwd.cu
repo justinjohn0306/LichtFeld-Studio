@@ -3,13 +3,13 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include <cooperative_groups.h>
-#include <cstdio>
 #include <cuda_runtime.h>
 
 #include "Cameras.cuh"
 #include "Common.h"
 #include "Rasterization.h"
 #include "Utils.cuh"
+#include "core/cuda_safe_format.hpp"
 
 // Use standard CUDA atomic add
 #ifndef gpuAtomicAdd
@@ -62,11 +62,13 @@ namespace gsplat_lfs {
                                                       // image_width, CDIM]
         const scalar_t* __restrict__ v_render_alphas, // [C, image_height, image_width, 1]
         // grad inputs
-        vec3* __restrict__ v_means,        // [N, 3]
-        vec4* __restrict__ v_quats,        // [N, 4]
-        vec3* __restrict__ v_scales,       // [N, 3]
-        scalar_t* __restrict__ v_colors,   // [C, N, CDIM] or [nnz, CDIM]
-        scalar_t* __restrict__ v_opacities // [C, N] or [nnz]
+        vec3* __restrict__ v_means,                          // [N, 3]
+        vec4* __restrict__ v_quats,                          // [N, 4]
+        vec3* __restrict__ v_scales,                         // [N, 3]
+        scalar_t* __restrict__ v_colors,                     // [C, N, CDIM] or [nnz, CDIM]
+        scalar_t* __restrict__ v_opacities,                  // [C, N] or [nnz]
+        float* __restrict__ densification_info,              // [2, N] flattened or nullptr
+        const scalar_t* __restrict__ densification_error_map // [H, W] or nullptr
     ) {
         auto block = cg::this_thread_block();
         uint32_t cid = block.group_index().x;
@@ -331,6 +333,8 @@ namespace gsplat_lfs {
                 vec3 v_scale_local = {0.f, 0.f, 0.f};
                 vec4 v_quat_local = {0.f, 0.f, 0.f, 0.f};
                 float v_opacity_local = 0.f;
+                float densification_weight_local = 0.f;
+                float densification_error_weighted_local = 0.f;
                 // initialize everything to 0, only set if the lane is valid
                 if (valid) {
                     // compute the current T for this gaussian
@@ -341,6 +345,11 @@ namespace gsplat_lfs {
 #pragma unroll
                     for (uint32_t k = 0; k < CDIM; ++k) {
                         v_rgb_local[k] = fac * v_render_c[k];
+                    }
+                    if (densification_info != nullptr && densification_error_map != nullptr) {
+                        const float pixel_error = densification_error_map[pix_id];
+                        densification_weight_local = fac;
+                        densification_error_weighted_local = fac * pixel_error;
                     }
                     // contribution from this pixel
                     float v_alpha = 0.f;
@@ -396,6 +405,8 @@ namespace gsplat_lfs {
                 warpSum(v_scale_local, warp);
                 warpSum(v_quat_local, warp);
                 warpSum(v_opacity_local, warp);
+                warpSum(densification_weight_local, warp);
+                warpSum(densification_error_weighted_local, warp);
                 if (warp.thread_rank() == 0) {
                     int32_t g = id_batch[t]; // flatten index in [C * N] or [nnz]
                     float* v_rgb_ptr = (float*)(v_colors) + CDIM * g;
@@ -421,6 +432,10 @@ namespace gsplat_lfs {
                     gpuAtomicAdd(v_quat_ptr + 3, v_quat_local.w);
 
                     gpuAtomicAdd(v_opacities + g, v_opacity_local);
+                    if (densification_info != nullptr && densification_error_map != nullptr) {
+                        gpuAtomicAdd(densification_info + g, densification_weight_local);
+                        gpuAtomicAdd(densification_info + N + g, densification_error_weighted_local);
+                    }
                 }
             }
         }
@@ -466,6 +481,8 @@ namespace gsplat_lfs {
         float* v_scales,
         float* v_colors,
         float* v_opacities,
+        float* densification_info,
+        const float* densification_error_map,
         cudaStream_t stream) {
         const bool packed = false; // Only support non-packed for now
         const uint32_t tile_width = (image_width + tile_size - 1) / tile_size;
@@ -489,10 +506,12 @@ namespace gsplat_lfs {
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             shmem_size);
         if (err != cudaSuccess) {
-            fprintf(stderr,
-                    "GSPLAT ERROR: Failed to set maximum shared memory size "
-                    "(requested %ld bytes), try lowering tile_size. CUDA error: %s\n",
-                    shmem_size, cudaGetErrorString(err));
+            lfs::core::ensure_cuda_success(
+                err, "cudaFuncSetAttribute(gsplat backward shared memory)",
+                lfs::core::detail::format_cuda_safe(
+                    "requested_bytes={}, try lowering tile_size", shmem_size),
+                LFS_SOURCE_SITE_CURRENT(),
+                lfs::core::CudaFailureDisposition::LogOnly);
             return;
         }
 
@@ -534,7 +553,10 @@ namespace gsplat_lfs {
                 reinterpret_cast<vec4*>(v_quats),
                 reinterpret_cast<vec3*>(v_scales),
                 v_colors,
-                v_opacities);
+                v_opacities,
+                densification_info,
+                densification_error_map);
+        LFS_CUDA_LAUNCH_CHECK(stream, "gsplat.rasterize_to_pixels_bwd");
     }
 
     ////////////////////////////////////////////////////////////////
@@ -577,6 +599,8 @@ namespace gsplat_lfs {
         float* v_scales,                                                       \
         float* v_colors,                                                       \
         float* v_opacities,                                                    \
+        float* densification_info,                                             \
+        const float* densification_error_map,                                  \
         cudaStream_t stream);
 
     __INS__(1)

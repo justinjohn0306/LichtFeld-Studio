@@ -72,7 +72,7 @@ namespace lfs::io {
         }
 
         LOG_INFO("Loading checkpoint file: {}", lfs::core::path_to_utf8(path));
-        auto splat_result = lfs::training::load_checkpoint_splat_data(path);
+        auto splat_result = lfs::core::load_checkpoint_splat_data(path, options.splat_tensor_allocator);
         if (!splat_result) {
             return make_error(ErrorCode::CORRUPTED_DATA,
                               std::format("Failed to load checkpoint: {}", splat_result.error()), path);
@@ -123,9 +123,12 @@ namespace lfs::io {
             return false;
         }
 
-        uint32_t magic;
+        uint32_t magic = 0;
         file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-        return magic == lfs::training::CHECKPOINT_MAGIC;
+        if (!file) {
+            return false;
+        }
+        return magic == lfs::core::CHECKPOINT_MAGIC;
     }
 
     std::string CheckpointLoader::name() const {
@@ -140,9 +143,9 @@ namespace lfs::io {
         return 15; // Higher priority than PLY since it contains more info
     }
 
-    std::expected<lfs::training::CheckpointHeader, std::string> CheckpointLoader::loadHeader(
+    std::expected<lfs::core::CheckpointHeader, std::string> CheckpointLoader::loadHeader(
         const std::filesystem::path& path) {
-        return lfs::training::load_checkpoint_header(path);
+        return lfs::core::load_checkpoint_header(path);
     }
 
     std::expected<int, std::string> CheckpointLoader::getIteration(

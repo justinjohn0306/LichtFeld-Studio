@@ -6,9 +6,15 @@
 #include "core/path_utils.hpp"
 #include "internal/resource_paths.hpp"
 #include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <nlohmann/json.hpp>
+#include <optional>
+#include <set>
+#include <utility>
+#include <vector>
 
 namespace lfs::vis {
 
@@ -33,20 +39,20 @@ namespace lfs::vis {
 
         // Theme state
         Theme g_current_theme;
-        Theme g_dark_theme;
-        Theme g_light_theme;
+        std::string g_current_theme_id = "dark";
+        float g_dpi_scale = 1.0f;
         bool g_initialized = false;
         bool g_themes_loaded = false;
 
-        // Hot-reload state
-        std::filesystem::path g_dark_path;
-        std::filesystem::path g_light_path;
-        std::filesystem::file_time_type g_dark_mtime;
-        std::filesystem::file_time_type g_light_mtime;
+        void ensureThemesLoaded();
+        void applyCurrentTheme(const Theme& theme, std::string_view theme_id);
+        bool activateThemePreset(std::string_view theme_id);
 
         void ensureInitialized() {
             if (!g_initialized) {
+                ensureThemesLoaded();
                 g_current_theme = darkTheme();
+                g_current_theme_id = "dark";
                 g_initialized = true;
             }
         }
@@ -77,6 +83,48 @@ namespace lfs::vis {
                 return {j[0].get<float>(), j[1].get<float>()};
             }
             return {0.0f, 0.0f};
+        }
+
+        std::string normalizeThemeIdImpl(std::string name) {
+            std::transform(
+                name.begin(),
+                name.end(),
+                name.begin(),
+                [](const unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+            std::replace(name.begin(), name.end(), '-', '_');
+            std::replace(name.begin(), name.end(), ' ', '_');
+
+            if (name == "gruvbox_dark") {
+                return "gruvbox";
+            }
+            if (name == "catppuccin" || name == "catppuccin_dark") {
+                return "catppuccin_mocha";
+            }
+            if (name == "catppuccin_light") {
+                return "catppuccin_latte";
+            }
+            if (name == "nord_dark") {
+                return "nord";
+            }
+            return name;
+        }
+
+        bool useLightPopupBackground(const Theme& t) {
+            // Use palette luminance instead of theme name so popup behavior stays
+            // correct even if theme names vary or are edited in JSON files.
+            constexpr float LIGHT_POPUP_BG_THRESHOLD = 0.72f;
+            const float brightness =
+                (t.palette.background.x + t.palette.background.y + t.palette.background.z) / 3.0f;
+            return brightness >= LIGHT_POPUP_BG_THRESHOLD;
+        }
+
+        ImVec4 mix(const ImVec4& a, const ImVec4& b, const float factor) {
+            return {
+                a.x + (b.x - a.x) * factor,
+                a.y + (b.y - a.y) * factor,
+                a.z + (b.z - a.z) * factor,
+                a.w + (b.w - a.w) * factor};
         }
 
     } // namespace
@@ -172,15 +220,17 @@ namespace lfs::vis {
     ImU32 Theme::row_odd_u32() const { return toU32(palette.row_odd); }
 
     void Theme::pushContextMenuStyle() const {
-        ImGui::PushStyleColor(ImGuiCol_PopupBg, palette.surface);
+        const ImVec4 popup_bg = useLightPopupBackground(*this) ? palette.background : palette.surface;
+        ImGui::PushStyleColor(ImGuiCol_PopupBg, popup_bg);
         ImGui::PushStyleColor(ImGuiCol_Border, palette.border);
         ImGui::PushStyleColor(ImGuiCol_Header, withAlpha(palette.primary, context_menu.header_alpha));
         ImGui::PushStyleColor(ImGuiCol_HeaderHovered, withAlpha(palette.primary, context_menu.header_hover_alpha));
         ImGui::PushStyleColor(ImGuiCol_HeaderActive, withAlpha(palette.primary, context_menu.header_active_alpha));
         ImGui::PushStyleColor(ImGuiCol_Text, palette.text);
-        ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, context_menu.rounding);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, context_menu.padding);
-        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, context_menu.item_spacing);
+        const float dpi = g_dpi_scale;
+        ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, context_menu.rounding * dpi);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(context_menu.padding.x * dpi, context_menu.padding.y * dpi));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(context_menu.item_spacing.x * dpi, context_menu.item_spacing.y * dpi));
     }
 
     void Theme::popContextMenuStyle() {
@@ -188,20 +238,83 @@ namespace lfs::vis {
         ImGui::PopStyleColor(6);
     }
 
+    void Theme::pushModalStyle() const {
+        constexpr float MODAL_BG_ALPHA = 0.98f;
+        constexpr float MODAL_BORDER_SIZE = 2.0f;
+        constexpr float MODAL_PADDING_X = 20.0f;
+        constexpr float MODAL_PADDING_Y = 15.0f;
+        constexpr float TITLE_DARKEN = 0.1f;
+        constexpr float TITLE_ACTIVE_DARKEN = 0.05f;
+        const bool is_light_popup = useLightPopupBackground(*this);
+        const ImVec4 modal_surface = is_light_popup ? palette.background : palette.surface;
+        const ImVec4 popup_bg{modal_surface.x, modal_surface.y, modal_surface.z, MODAL_BG_ALPHA};
+        const ImVec4 title_bg = darken(modal_surface, is_light_popup ? 0.0f : TITLE_DARKEN);
+        const ImVec4 title_bg_active = darken(modal_surface, is_light_popup ? 0.0f : TITLE_ACTIVE_DARKEN);
+
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, popup_bg);
+        ImGui::PushStyleColor(ImGuiCol_PopupBg, popup_bg);
+        ImGui::PushStyleColor(ImGuiCol_TitleBg, title_bg);
+        ImGui::PushStyleColor(ImGuiCol_TitleBgActive, title_bg_active);
+        ImGui::PushStyleColor(ImGuiCol_Border, palette.border);
+        ImGui::PushStyleColor(ImGuiCol_Text, palette.text);
+        const float dpi = g_dpi_scale;
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, MODAL_BORDER_SIZE * dpi);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, sizes.popup_rounding * dpi);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(MODAL_PADDING_X * dpi, MODAL_PADDING_Y * dpi));
+    }
+
+    void Theme::popModalStyle() {
+        ImGui::PopStyleVar(3);
+        ImGui::PopStyleColor(6);
+    }
+
+    void setThemeDpiScale(const float scale) { g_dpi_scale = scale; }
+    float getThemeDpiScale() { return g_dpi_scale; }
+
     // Global access
     const Theme& theme() {
         ensureInitialized();
         return g_current_theme;
     }
 
-    void setTheme(const Theme& t) {
-        g_current_theme = t;
-        g_initialized = true;
-        applyThemeToImGui();
+    namespace {
+        ThemeChangeCallback g_theme_change_cb;
     }
+
+    void setThemeChangeCallback(ThemeChangeCallback cb) { g_theme_change_cb = std::move(cb); }
+
+    const std::string& currentThemeId() {
+        ensureInitialized();
+        return g_current_theme_id;
+    }
+
+    std::string normalizeThemeId(std::string name) {
+        return normalizeThemeIdImpl(std::move(name));
+    }
+
+    void setTheme(const Theme& t) {
+        applyCurrentTheme(t, normalizeThemeIdImpl(t.name));
+    }
+
+    namespace {
+        void applyThemePreservingCurrentId(const Theme& t) {
+            ensureInitialized();
+
+            // Keep runtime style tweaks attached to the active preset ID so
+            // RML theme activation and preset hot-reload continue to target
+            // the selected preset even if the theme JSON name is customized.
+            const std::string active_theme_id = g_current_theme_id;
+            applyCurrentTheme(t, active_theme_id);
+        }
+    } // namespace
 
     void applyThemeToImGui() {
         ensureInitialized();
+        if (ImGui::GetCurrentContext() == nullptr) {
+            // Headless Python sessions can still read and mutate theme state
+            // even when no ImGui style exists to update.
+            return;
+        }
         ImGuiStyle& style = ImGui::GetStyle();
         const auto& p = g_current_theme.palette;
         const auto& s = g_current_theme.sizes;
@@ -209,7 +322,7 @@ namespace lfs::vis {
         style.WindowRounding = s.window_rounding;
         style.FrameRounding = s.frame_rounding;
         style.PopupRounding = s.popup_rounding;
-        style.ScrollbarRounding = s.scrollbar_rounding;
+        style.ScrollbarRounding = std::max(s.scrollbar_rounding, s.scrollbar_size * 0.5f);
         style.GrabRounding = s.grab_rounding;
         style.TabRounding = s.tab_rounding;
         style.WindowBorderSize = s.border_size;
@@ -224,32 +337,43 @@ namespace lfs::vis {
         style.GrabMinSize = s.grab_min_size;
         style.WindowTitleAlign = ImVec2(0.5f, 0.5f);
 
+        const bool is_light = g_current_theme.isLightTheme();
+        const bool is_light_popup = useLightPopupBackground(g_current_theme);
+        const ImVec4 window_bg = p.surface;
+        const ImVec4 child_bg = is_light ? darken(p.surface, 0.015f) : darken(p.surface, 0.025f);
+        const ImVec4 popup_bg = is_light_popup ? lighten(p.surface, 0.02f) : lighten(p.surface, 0.01f);
+        const ImVec4 title_bg = is_light ? darken(p.surface, 0.02f) : lighten(p.surface, 0.035f);
+        const ImVec4 title_bg_active = is_light ? mix(p.surface, p.surface_bright, 0.55f)
+                                                : mix(p.surface, p.surface_bright, 0.75f);
+        const ImVec4 button_bg = is_light ? darken(p.surface, 0.01f) : darken(p.surface, 0.015f);
+        const ImVec4 tab_bg = is_light ? darken(p.surface, 0.01f) : darken(p.surface, 0.008f);
+        const ImVec4 tab_active_bg = is_light ? mix(p.surface_bright, p.primary_dim, 0.10f)
+                                              : mix(p.surface_bright, p.primary_dim, 0.18f);
         ImVec4* const colors = style.Colors;
         colors[ImGuiCol_Text] = p.text;
         colors[ImGuiCol_TextDisabled] = p.text_dim;
-        colors[ImGuiCol_WindowBg] = p.background;
-        colors[ImGuiCol_ChildBg] = p.background;
-        colors[ImGuiCol_PopupBg] = p.surface;
+        colors[ImGuiCol_WindowBg] = window_bg;
+        colors[ImGuiCol_ChildBg] = child_bg;
+        colors[ImGuiCol_PopupBg] = popup_bg;
         colors[ImGuiCol_Border] = p.border;
         colors[ImGuiCol_BorderShadow] = ImVec4(0, 0, 0, 0);
 
-        const bool is_light = g_current_theme.isLightTheme();
         const float frame_darken = g_current_theme.frameDarkenAmount();
-        colors[ImGuiCol_FrameBg] = darken(p.surface, frame_darken);
+        colors[ImGuiCol_FrameBg] = darken(window_bg, frame_darken);
         colors[ImGuiCol_FrameBgHovered] = is_light ? darken(p.surface, 0.08f) : p.surface_bright;
         colors[ImGuiCol_FrameBgActive] = p.primary_dim;
-        colors[ImGuiCol_TitleBg] = p.surface;
-        colors[ImGuiCol_TitleBgActive] = p.surface;
-        colors[ImGuiCol_TitleBgCollapsed] = p.surface;
-        colors[ImGuiCol_MenuBarBg] = p.surface;
-        colors[ImGuiCol_ScrollbarBg] = darken(p.background, 0.05f);
-        colors[ImGuiCol_ScrollbarGrab] = p.surface_bright;
-        colors[ImGuiCol_ScrollbarGrabHovered] = lighten(p.surface_bright, 0.1f);
+        colors[ImGuiCol_TitleBg] = title_bg;
+        colors[ImGuiCol_TitleBgActive] = title_bg_active;
+        colors[ImGuiCol_TitleBgCollapsed] = title_bg;
+        colors[ImGuiCol_MenuBarBg] = title_bg;
+        colors[ImGuiCol_ScrollbarBg] = withAlpha(p.background, 0.5f);
+        colors[ImGuiCol_ScrollbarGrab] = withAlpha(p.text_dim, 0.63f);
+        colors[ImGuiCol_ScrollbarGrabHovered] = withAlpha(p.primary, 0.78f);
         colors[ImGuiCol_ScrollbarGrabActive] = p.primary;
         colors[ImGuiCol_CheckMark] = p.primary;
         colors[ImGuiCol_SliderGrab] = p.primary;
         colors[ImGuiCol_SliderGrabActive] = lighten(p.primary, 0.1f);
-        colors[ImGuiCol_Button] = p.surface;
+        colors[ImGuiCol_Button] = button_bg;
         colors[ImGuiCol_ButtonHovered] = p.surface_bright;
         colors[ImGuiCol_ButtonActive] = p.primary_dim;
         colors[ImGuiCol_Header] = withAlpha(p.primary, 0.25f);
@@ -261,20 +385,20 @@ namespace lfs::vis {
         colors[ImGuiCol_ResizeGrip] = withAlpha(p.primary, 0.2f);
         colors[ImGuiCol_ResizeGripHovered] = withAlpha(p.primary, 0.6f);
         colors[ImGuiCol_ResizeGripActive] = p.primary;
-        colors[ImGuiCol_Tab] = p.surface;
+        colors[ImGuiCol_Tab] = tab_bg;
         colors[ImGuiCol_TabHovered] = p.surface_bright;
-        colors[ImGuiCol_TabActive] = p.primary_dim;
-        colors[ImGuiCol_TabUnfocused] = p.surface;
-        colors[ImGuiCol_TabUnfocusedActive] = p.surface_bright;
+        colors[ImGuiCol_TabActive] = tab_active_bg;
+        colors[ImGuiCol_TabUnfocused] = tab_bg;
+        colors[ImGuiCol_TabUnfocusedActive] = tab_active_bg;
         colors[ImGuiCol_PlotLines] = p.primary;
         colors[ImGuiCol_PlotLinesHovered] = lighten(p.primary, 0.2f);
         colors[ImGuiCol_PlotHistogram] = p.primary;
         colors[ImGuiCol_PlotHistogramHovered] = lighten(p.primary, 0.2f);
-        colors[ImGuiCol_TableHeaderBg] = p.surface;
+        colors[ImGuiCol_TableHeaderBg] = title_bg;
         colors[ImGuiCol_TableBorderStrong] = p.border;
-        colors[ImGuiCol_TableBorderLight] = withAlpha(p.border, 0.5f);
+        colors[ImGuiCol_TableBorderLight] = withAlpha(p.border, 0.65f);
         colors[ImGuiCol_TableRowBg] = ImVec4(0, 0, 0, 0);
-        colors[ImGuiCol_TableRowBgAlt] = withAlpha(p.surface, 0.3f);
+        colors[ImGuiCol_TableRowBgAlt] = withAlpha(p.surface_bright, is_light ? 0.16f : 0.14f);
         colors[ImGuiCol_TextSelectedBg] = withAlpha(p.primary, 0.35f);
         colors[ImGuiCol_DragDropTarget] = p.primary;
         colors[ImGuiCol_NavHighlight] = p.primary;
@@ -283,6 +407,8 @@ namespace lfs::vis {
         colors[ImGuiCol_ModalWindowDimBg] = withAlpha(p.background, 0.35f);
 
         style.FrameBorderSize = is_light ? 1.0f : 0.0f;
+
+        style.ScaleAllSizes(g_dpi_scale);
     }
 
     namespace {
@@ -308,6 +434,13 @@ namespace lfs::vis {
             },
             .sizes = {},
             .fonts = {},
+            .menu = {},
+            .context_menu = {},
+            .viewport = {},
+            .shadows = {},
+            .vignette = {},
+            .button = {},
+            .overlay = {},
         };
 
         const Theme DEFAULT_LIGHT = {
@@ -331,6 +464,12 @@ namespace lfs::vis {
             },
             .sizes = {},
             .fonts = {},
+            .menu = {},
+            .context_menu = {},
+            .viewport = {},
+            .shadows = {},
+            .vignette = {},
+            .button = {},
             .overlay = {
                 .background = {0.95f, 0.95f, 0.96f, 1.0f},
                 .text = {0.1f, 0.1f, 0.12f, 1.0f},
@@ -343,29 +482,411 @@ namespace lfs::vis {
             },
         };
 
-        void loadThemesFromFiles() {
-            // Load dark theme
-            g_dark_theme = DEFAULT_DARK;
-            try {
-                g_dark_path = getAssetPath("themes/dark.json");
-                if (loadTheme(g_dark_theme, lfs::core::path_to_utf8(g_dark_path))) {
-                    g_dark_mtime = std::filesystem::last_write_time(g_dark_path);
-                    LOG_INFO("Loaded dark theme from {}", lfs::core::path_to_utf8(g_dark_path));
-                }
-            } catch (...) {
-                g_dark_path.clear();
+        const Theme DEFAULT_GRUVBOX = {
+            .name = "Gruvbox",
+            .palette = {
+                .background = {0.157f, 0.157f, 0.157f, 1.0f},     // #282828
+                .surface = {0.235f, 0.220f, 0.212f, 1.0f},        // #3c3836
+                .surface_bright = {0.314f, 0.286f, 0.271f, 1.0f}, // #504945
+                .primary = {0.514f, 0.647f, 0.596f, 1.0f},        // #83a598
+                .primary_dim = {0.271f, 0.522f, 0.533f, 1.0f},    // #458588
+                .secondary = {0.827f, 0.525f, 0.608f, 1.0f},      // #d3869b
+                .text = {0.922f, 0.859f, 0.698f, 1.0f},           // #ebdbb2
+                .text_dim = {0.573f, 0.514f, 0.455f, 1.0f},       // #928374
+                .border = {0.400f, 0.361f, 0.329f, 1.0f},         // #665c54
+                .success = {0.722f, 0.733f, 0.149f, 1.0f},        // #b8bb26
+                .warning = {0.980f, 0.741f, 0.184f, 1.0f},        // #fabd2f
+                .error = {0.984f, 0.286f, 0.204f, 1.0f},          // #fb4934
+                .info = {0.557f, 0.753f, 0.486f, 1.0f},           // #8ec07c
+                .row_even = {1.0f, 1.0f, 1.0f, 0.035f},
+                .row_odd = {0.0f, 0.0f, 0.0f, 0.14f},
+            },
+            .sizes = {},
+            .fonts = {},
+            .menu = {},
+            .context_menu = {},
+            .viewport = {},
+            .shadows = {},
+            .vignette = {},
+            .button = {},
+            .overlay = {
+                .background = {0.235f, 0.220f, 0.212f, 1.0f},
+                .text = {0.922f, 0.859f, 0.698f, 1.0f},
+                .text_dim = {0.573f, 0.514f, 0.455f, 1.0f},
+                .border = {0.514f, 0.459f, 0.424f, 1.0f}, // #82756a
+                .icon = {0.514f, 0.647f, 0.596f, 1.0f},
+                .highlight = {0.400f, 0.467f, 0.431f, 1.0f},
+                .selection = {0.271f, 0.522f, 0.533f, 1.0f},
+                .selection_flash = {0.557f, 0.753f, 0.486f, 1.0f},
+            },
+        };
+
+        const Theme DEFAULT_CATPPUCCIN_MOCHA = {
+            .name = "Catppuccin Mocha",
+            .palette = {
+                .background = {0.118f, 0.118f, 0.180f, 1.0f},
+                .surface = {0.188f, 0.196f, 0.259f, 1.0f},
+                .surface_bright = {0.271f, 0.278f, 0.353f, 1.0f},
+                .primary = {0.537f, 0.706f, 0.980f, 1.0f},
+                .primary_dim = {0.455f, 0.780f, 0.925f, 1.0f},
+                .secondary = {0.796f, 0.651f, 0.969f, 1.0f},
+                .text = {0.804f, 0.839f, 0.957f, 1.0f},
+                .text_dim = {0.651f, 0.678f, 0.784f, 1.0f},
+                .border = {0.345f, 0.353f, 0.443f, 1.0f},
+                .success = {0.651f, 0.890f, 0.631f, 1.0f},
+                .warning = {0.976f, 0.886f, 0.686f, 1.0f},
+                .error = {0.953f, 0.545f, 0.659f, 1.0f},
+                .info = {0.537f, 0.706f, 0.980f, 1.0f},
+                .row_even = {1.0f, 1.0f, 1.0f, 0.035f},
+                .row_odd = {0.0f, 0.0f, 0.0f, 0.13f},
+            },
+            .sizes = {},
+            .fonts = {},
+            .menu = {},
+            .context_menu = {},
+            .viewport = {},
+            .shadows = {},
+            .vignette = {},
+            .button = {},
+            .overlay = {
+                .background = {0.188f, 0.196f, 0.259f, 1.0f},
+                .text = {0.804f, 0.839f, 0.957f, 1.0f},
+                .text_dim = {0.651f, 0.678f, 0.784f, 1.0f},
+                .border = {0.455f, 0.780f, 0.925f, 1.0f},
+                .icon = {0.537f, 0.706f, 0.980f, 1.0f},
+                .highlight = {0.455f, 0.502f, 0.624f, 1.0f},
+                .selection = {0.345f, 0.482f, 0.757f, 1.0f},
+                .selection_flash = {0.651f, 0.890f, 0.631f, 1.0f},
+            },
+        };
+
+        const Theme DEFAULT_CATPPUCCIN_LATTE = {
+            .name = "Catppuccin Latte",
+            .palette = {
+                .background = {0.937f, 0.945f, 0.961f, 1.0f},
+                .surface = {0.902f, 0.914f, 0.937f, 1.0f},
+                .surface_bright = {0.863f, 0.878f, 0.910f, 1.0f},
+                .primary = {0.118f, 0.400f, 0.961f, 1.0f},
+                .primary_dim = {0.125f, 0.624f, 0.710f, 1.0f},
+                .secondary = {0.533f, 0.224f, 0.937f, 1.0f},
+                .text = {0.298f, 0.310f, 0.412f, 1.0f},
+                .text_dim = {0.424f, 0.435f, 0.522f, 1.0f},
+                .border = {0.675f, 0.690f, 0.741f, 1.0f},
+                .success = {0.251f, 0.627f, 0.169f, 1.0f},
+                .warning = {0.875f, 0.557f, 0.114f, 1.0f},
+                .error = {0.824f, 0.059f, 0.224f, 1.0f},
+                .info = {0.118f, 0.400f, 0.961f, 1.0f},
+                .row_even = {0.0f, 0.0f, 0.0f, 0.03f},
+                .row_odd = {0.0f, 0.0f, 0.0f, 0.08f},
+            },
+            .sizes = {},
+            .fonts = {},
+            .menu = {},
+            .context_menu = {},
+            .viewport = {},
+            .shadows = {},
+            .vignette = {},
+            .button = {},
+            .overlay = {
+                .background = {0.937f, 0.945f, 0.961f, 1.0f},
+                .text = {0.298f, 0.310f, 0.412f, 1.0f},
+                .text_dim = {0.424f, 0.435f, 0.522f, 1.0f},
+                .border = {0.675f, 0.690f, 0.741f, 1.0f},
+                .icon = {0.125f, 0.624f, 0.710f, 1.0f},
+                .highlight = {0.804f, 0.839f, 0.957f, 1.0f},
+                .selection = {0.627f, 0.729f, 0.949f, 1.0f},
+                .selection_flash = {0.745f, 0.816f, 0.969f, 1.0f},
+            },
+        };
+
+        const Theme DEFAULT_NORD = {
+            .name = "Nord",
+            .palette = {
+                .background = {0.180f, 0.204f, 0.251f, 1.0f},
+                .surface = {0.231f, 0.259f, 0.322f, 1.0f},
+                .surface_bright = {0.263f, 0.298f, 0.369f, 1.0f},
+                .primary = {0.533f, 0.753f, 0.816f, 1.0f},
+                .primary_dim = {0.369f, 0.506f, 0.675f, 1.0f},
+                .secondary = {0.706f, 0.557f, 0.678f, 1.0f},
+                .text = {0.925f, 0.937f, 0.957f, 1.0f},
+                .text_dim = {0.722f, 0.753f, 0.816f, 1.0f},
+                .border = {0.298f, 0.333f, 0.420f, 1.0f},
+                .success = {0.639f, 0.745f, 0.549f, 1.0f},
+                .warning = {0.922f, 0.796f, 0.545f, 1.0f},
+                .error = {0.749f, 0.380f, 0.416f, 1.0f},
+                .info = {0.561f, 0.737f, 0.733f, 1.0f},
+                .row_even = {1.0f, 1.0f, 1.0f, 0.032f},
+                .row_odd = {0.0f, 0.0f, 0.0f, 0.12f},
+            },
+            .sizes = {},
+            .fonts = {},
+            .menu = {},
+            .context_menu = {},
+            .viewport = {},
+            .shadows = {},
+            .vignette = {},
+            .button = {},
+            .overlay = {
+                .background = {0.231f, 0.259f, 0.322f, 1.0f},
+                .text = {0.925f, 0.937f, 0.957f, 1.0f},
+                .text_dim = {0.722f, 0.753f, 0.816f, 1.0f},
+                .border = {0.533f, 0.753f, 0.816f, 1.0f},
+                .icon = {0.561f, 0.737f, 0.733f, 1.0f},
+                .highlight = {0.369f, 0.427f, 0.518f, 1.0f},
+                .selection = {0.369f, 0.506f, 0.675f, 1.0f},
+                .selection_flash = {0.639f, 0.745f, 0.549f, 1.0f},
+            },
+        };
+
+        constexpr std::string_view THEMES_MANIFEST_ASSET_NAME = "themes/manifest.json";
+        constexpr std::string_view THEMES_ASSET_PREFIX = "themes/";
+
+        struct ThemeDefaultRecord {
+            std::string_view id;
+            const Theme* theme;
+        };
+
+        const ThemeDefaultRecord THEME_DEFAULTS[] = {
+            {"dark", &DEFAULT_DARK},
+            {"light", &DEFAULT_LIGHT},
+            {"gruvbox", &DEFAULT_GRUVBOX},
+            {"catppuccin_mocha", &DEFAULT_CATPPUCCIN_MOCHA},
+            {"catppuccin_latte", &DEFAULT_CATPPUCCIN_LATTE},
+            {"nord", &DEFAULT_NORD},
+        };
+
+        struct ThemePresetRecord {
+            ThemePresetRecord(
+                std::string preset_id,
+                std::string preset_asset_name,
+                const Theme* preset_defaults,
+                ThemePresetInfo preset_info)
+                : id(std::move(preset_id)),
+                  asset_name(std::move(preset_asset_name)),
+                  defaults(preset_defaults),
+                  theme(*preset_defaults),
+                  info(std::move(preset_info)) {}
+
+            std::string id;
+            std::string asset_name;
+            const Theme* defaults;
+            Theme theme;
+            ThemePresetInfo info;
+            std::filesystem::path path;
+            std::filesystem::file_time_type mtime{};
+        };
+
+        std::vector<ThemePresetRecord> g_theme_presets;
+        std::filesystem::path g_theme_manifest_path;
+        std::filesystem::file_time_type g_theme_manifest_mtime{};
+
+        ThemePresetRecord* findThemePreset(std::string_view theme_id) {
+            const auto normalized = normalizeThemeIdImpl(std::string(theme_id));
+            for (auto& preset : g_theme_presets) {
+                if (normalized == preset.id)
+                    return &preset;
+            }
+            return nullptr;
+        }
+
+        const Theme* findThemeDefaults(std::string_view theme_id) {
+            const auto normalized = normalizeThemeIdImpl(std::string(theme_id));
+            for (const auto& defaults : THEME_DEFAULTS) {
+                if (normalized == defaults.id)
+                    return defaults.theme;
+            }
+            return nullptr;
+        }
+
+        bool isKnownThemePresetId(std::string_view theme_id) {
+            ensureThemesLoaded();
+            return findThemePreset(theme_id) != nullptr;
+        }
+
+        void syncThemePresetName(ThemePresetRecord& preset) {
+            preset.info.name = preset.theme.name.empty() ? preset.defaults->name : preset.theme.name;
+        }
+
+        bool isSafeThemeRelativeFile(const std::string& file_name) {
+            if (file_name.empty())
+                return false;
+            if (file_name.find(':') != std::string::npos)
+                return false;
+
+            const std::filesystem::path relative_path = lfs::core::utf8_to_path(file_name);
+            if (relative_path.is_absolute() || relative_path.has_root_name() || relative_path.has_root_directory())
+                return false;
+
+            for (const auto& part : relative_path) {
+                if (part == "..")
+                    return false;
+            }
+            return true;
+        }
+
+        ThemePresetRecord makeFallbackDarkPreset() {
+            ThemePresetInfo info{
+                .id = "dark",
+                .name = DEFAULT_DARK.name,
+                .label_key = "menu.view.theme.dark",
+                .mode = "dark",
+                .order = 10,
+            };
+            return ThemePresetRecord("dark", "themes/dark.json", &DEFAULT_DARK, std::move(info));
+        }
+
+        std::optional<ThemePresetRecord> parseThemeManifestEntry(
+            const json& entry,
+            const std::size_t entry_index,
+            std::set<std::string>& ids) {
+            if (!entry.is_object()) {
+                LOG_WARN("Ignoring theme manifest entry {}: expected object", entry_index);
+                return std::nullopt;
             }
 
-            // Load light theme
-            g_light_theme = DEFAULT_LIGHT;
+            const std::string raw_id = entry.value("id", "");
+            const std::string id = normalizeThemeIdImpl(raw_id);
+            if (raw_id.empty() || id != raw_id) {
+                LOG_WARN("Ignoring theme manifest entry {}: invalid id '{}'", entry_index, raw_id);
+                return std::nullopt;
+            }
+
+            if (!ids.insert(id).second) {
+                LOG_WARN("Ignoring duplicate theme id '{}' in manifest", id);
+                return std::nullopt;
+            }
+
+            const std::string file = entry.value("file", "");
+            if (!isSafeThemeRelativeFile(file)) {
+                LOG_WARN("Ignoring theme '{}' in manifest: unsafe or empty file '{}'", id, file);
+                return std::nullopt;
+            }
+
+            std::string fallback_id = normalizeThemeIdImpl(entry.value("fallback", id));
+            const Theme* defaults = findThemeDefaults(fallback_id);
+            if (!defaults) {
+                LOG_WARN("Theme '{}' references unknown fallback '{}'; using dark", id, fallback_id);
+                fallback_id = "dark";
+                defaults = &DEFAULT_DARK;
+            }
+
+            ThemePresetInfo info{
+                .id = id,
+                .name = defaults->name,
+                .label_key = entry.value("label_key", "menu.view.theme." + id),
+                .mode = entry.value(
+                    "mode",
+                    std::string(defaults->isLightTheme() ? "light" : "dark")),
+                .order = entry.value("order", static_cast<int>((entry_index + 1) * 10)),
+            };
+
+            if (info.mode != "dark" && info.mode != "light") {
+                LOG_WARN("Theme '{}' has invalid mode '{}'; deriving mode from fallback", id, info.mode);
+                info.mode = defaults->isLightTheme() ? "light" : "dark";
+            }
+
+            return ThemePresetRecord(
+                id,
+                std::string(THEMES_ASSET_PREFIX) + file,
+                defaults,
+                std::move(info));
+        }
+
+        std::vector<ThemePresetRecord> loadThemeCatalogFromManifest() {
+            std::vector<ThemePresetRecord> presets;
+
             try {
-                g_light_path = getAssetPath("themes/light.json");
-                if (loadTheme(g_light_theme, lfs::core::path_to_utf8(g_light_path))) {
-                    g_light_mtime = std::filesystem::last_write_time(g_light_path);
-                    LOG_INFO("Loaded light theme from {}", lfs::core::path_to_utf8(g_light_path));
+                g_theme_manifest_path = getAssetPath(std::string(THEMES_MANIFEST_ASSET_NAME));
+                g_theme_manifest_mtime = std::filesystem::last_write_time(g_theme_manifest_path);
+
+                std::ifstream file;
+                if (!lfs::core::open_file_for_read(g_theme_manifest_path, file))
+                    throw std::runtime_error("could not open manifest");
+
+                json manifest;
+                file >> manifest;
+
+                const int schema_version = manifest.value("schema_version", 0);
+                if (schema_version != 1)
+                    throw std::runtime_error("unsupported schema_version " + std::to_string(schema_version));
+
+                const auto themes_it = manifest.find("themes");
+                if (themes_it == manifest.end() || !themes_it->is_array())
+                    throw std::runtime_error("themes must be an array");
+
+                std::set<std::string> ids;
+                for (std::size_t i = 0; i < themes_it->size(); ++i) {
+                    if (auto preset = parseThemeManifestEntry((*themes_it)[i], i, ids)) {
+                        presets.push_back(std::move(*preset));
+                    }
                 }
+
+                std::stable_sort(
+                    presets.begin(),
+                    presets.end(),
+                    [](const ThemePresetRecord& a, const ThemePresetRecord& b) {
+                        return a.info.order < b.info.order;
+                    });
+
+                if (presets.empty())
+                    throw std::runtime_error("manifest did not define any valid themes");
+            } catch (const std::exception& e) {
+                LOG_WARN("Failed to load theme manifest: {}; falling back to built-in dark theme", e.what());
+                presets.push_back(makeFallbackDarkPreset());
+            }
+
+            return presets;
+        }
+
+        void loadThemePreset(ThemePresetRecord& preset) {
+            preset.theme = *preset.defaults;
+            preset.path.clear();
+            syncThemePresetName(preset);
+
+            try {
+                preset.path = getAssetPath(preset.asset_name);
+                if (!loadTheme(preset.theme, lfs::core::path_to_utf8(preset.path)))
+                    return;
+
+                syncThemePresetName(preset);
+                preset.mtime = std::filesystem::last_write_time(preset.path);
+                LOG_INFO("Loaded {} theme from {}", preset.id, lfs::core::path_to_utf8(preset.path));
             } catch (...) {
-                g_light_path.clear();
+                preset.path.clear();
+            }
+        }
+
+        bool hotReloadThemePreset(ThemePresetRecord& preset) {
+            if (preset.path.empty() || !std::filesystem::exists(preset.path))
+                return false;
+
+            const auto mtime = std::filesystem::last_write_time(preset.path);
+            if (mtime == preset.mtime)
+                return false;
+
+            Theme reloaded = *preset.defaults;
+            if (!loadTheme(reloaded, lfs::core::path_to_utf8(preset.path)))
+                return false;
+
+            preset.theme = std::move(reloaded);
+            syncThemePresetName(preset);
+            preset.mtime = mtime;
+            LOG_INFO("Hot-reloaded {} theme", preset.id);
+            return true;
+        }
+
+        void loadThemesFromFiles() {
+            g_theme_presets = loadThemeCatalogFromManifest();
+
+            std::vector<std::future<void>> jobs;
+            jobs.reserve(g_theme_presets.size());
+            for (auto& preset : g_theme_presets) {
+                jobs.emplace_back(std::async(std::launch::async, [&preset]() {
+                    loadThemePreset(preset);
+                }));
+            }
+            for (auto& job : jobs) {
+                job.get();
             }
 
             g_themes_loaded = true;
@@ -379,57 +900,115 @@ namespace lfs::vis {
 
     } // namespace
 
+    namespace {
+        const Theme& themePreset(std::string_view theme_id) {
+            ensureThemesLoaded();
+            const auto* preset = findThemePreset(theme_id);
+            return preset ? preset->theme : g_theme_presets.front().theme;
+        }
+    } // namespace
+
     const Theme& darkTheme() {
-        ensureThemesLoaded();
-        return g_dark_theme;
+        return themePreset("dark");
     }
 
     const Theme& lightTheme() {
-        ensureThemesLoaded();
-        return g_light_theme;
+        return themePreset("light");
     }
 
-    void checkThemeFileChanges() {
+    const Theme& gruvboxTheme() {
+        return themePreset("gruvbox");
+    }
+
+    const Theme& catppuccinMochaTheme() {
+        return themePreset("catppuccin_mocha");
+    }
+
+    const Theme& catppuccinLatteTheme() {
+        return themePreset("catppuccin_latte");
+    }
+
+    const Theme& nordTheme() {
+        return themePreset("nord");
+    }
+
+    void visitThemePresets(const ThemePresetVisitor& visitor) {
+        ensureThemesLoaded();
+        for (const auto& preset : g_theme_presets) {
+            visitor(preset.id, preset.theme);
+        }
+    }
+
+    void visitThemePresetInfos(const ThemePresetInfoVisitor& visitor) {
+        ensureThemesLoaded();
+        for (const auto& preset : g_theme_presets) {
+            visitor(preset.info);
+        }
+    }
+
+    namespace {
+        void applyCurrentTheme(const Theme& theme, std::string_view theme_id) {
+            g_current_theme = theme;
+            g_current_theme_id = std::string(theme_id);
+            g_initialized = true;
+            applyThemeToImGui();
+            if (g_theme_change_cb)
+                g_theme_change_cb(g_current_theme_id);
+        }
+
+        bool activateThemePreset(std::string_view theme_id) {
+            ensureThemesLoaded();
+
+            const auto* preset = findThemePreset(theme_id);
+            if (!preset)
+                return false;
+
+            applyCurrentTheme(preset->theme, preset->id);
+            return true;
+        }
+    } // namespace
+
+    bool setThemeByName(const std::string& name) {
+        return activateThemePreset(name);
+    }
+
+    bool checkThemeFileChanges() {
         if (!g_themes_loaded)
-            return;
+            return false;
 
-        bool current_is_dark = (g_current_theme.name == "Dark");
-        bool reloaded = false;
+        const std::string active_theme_id = g_current_theme_id;
+        bool any_reloaded = false;
+        bool active_theme_reloaded = false;
 
-        // Check dark theme
-        if (!g_dark_path.empty() && std::filesystem::exists(g_dark_path)) {
-            const auto mtime = std::filesystem::last_write_time(g_dark_path);
-            if (mtime != g_dark_mtime) {
-                Theme t = DEFAULT_DARK;
-                if (loadTheme(t, lfs::core::path_to_utf8(g_dark_path))) {
-                    g_dark_theme = t;
-                    g_dark_mtime = mtime;
-                    LOG_INFO("Hot-reloaded dark theme");
-                    if (current_is_dark)
-                        reloaded = true;
+        try {
+            if (!g_theme_manifest_path.empty() && std::filesystem::exists(g_theme_manifest_path)) {
+                const auto manifest_mtime = std::filesystem::last_write_time(g_theme_manifest_path);
+                if (manifest_mtime != g_theme_manifest_mtime) {
+                    LOG_INFO("Hot-reloading theme manifest");
+                    loadThemesFromFiles();
+                    if (!activateThemePreset(active_theme_id))
+                        activateThemePreset("dark");
+                    return true;
                 }
             }
+        } catch (...) {
+            LOG_WARN("Failed to check theme manifest for hot reload");
         }
 
-        // Check light theme
-        if (!g_light_path.empty() && std::filesystem::exists(g_light_path)) {
-            const auto mtime = std::filesystem::last_write_time(g_light_path);
-            if (mtime != g_light_mtime) {
-                Theme t = DEFAULT_LIGHT;
-                if (loadTheme(t, lfs::core::path_to_utf8(g_light_path))) {
-                    g_light_theme = t;
-                    g_light_mtime = mtime;
-                    LOG_INFO("Hot-reloaded light theme");
-                    if (!current_is_dark)
-                        reloaded = true;
-                }
-            }
+        for (auto& preset : g_theme_presets) {
+            if (!hotReloadThemePreset(preset))
+                continue;
+
+            any_reloaded = true;
+            if (active_theme_id == preset.id)
+                active_theme_reloaded = true;
         }
 
-        // Re-apply current theme if it was reloaded
-        if (reloaded) {
-            setTheme(current_is_dark ? g_dark_theme : g_light_theme);
+        if (active_theme_reloaded && !activateThemePreset(active_theme_id)) {
+            activateThemePreset("dark");
         }
+
+        return any_reloaded;
     }
 
     bool saveTheme(const Theme& t, const std::string& path) {
@@ -746,21 +1325,26 @@ namespace lfs::vis {
         }
     } // namespace
 
-    void saveThemePreference(bool is_dark) {
+    void saveThemePreferenceName(const std::string& theme_name) {
         try {
             const auto config_dir = getThemeConfigDir();
             std::filesystem::create_directories(config_dir);
             const auto pref_path = config_dir / "theme_preference";
             std::ofstream file(pref_path);
             if (file) {
-                file << (is_dark ? "dark" : "light");
+                const std::string normalized = normalizeThemeIdImpl(theme_name);
+                if (isKnownThemePresetId(normalized)) {
+                    file << normalized;
+                } else {
+                    file << "dark";
+                }
             }
         } catch (...) {
             // Silently ignore - not critical
         }
     }
 
-    bool loadThemePreference() {
+    std::string loadThemePreferenceName() {
         try {
             const auto config_dir = getThemeConfigDir();
             const auto pref_path = config_dir / "theme_preference";
@@ -768,13 +1352,74 @@ namespace lfs::vis {
                 std::ifstream file(pref_path);
                 std::string pref;
                 if (file >> pref) {
-                    return pref != "light";
+                    const std::string normalized = normalizeThemeIdImpl(pref);
+                    if (isKnownThemePresetId(normalized)) {
+                        return normalized;
+                    }
                 }
             }
         } catch (...) {
             // Silently ignore - not critical
         }
-        return true; // Default to dark
+        return "dark";
+    }
+
+    void saveThemePreference(const bool is_dark) {
+        saveThemePreferenceName(is_dark ? "dark" : "light");
+    }
+
+    bool loadThemePreference() {
+        return loadThemePreferenceName() != "light";
+    }
+
+    void saveUiScalePreference(float scale) {
+        try {
+            const auto config_dir = getThemeConfigDir();
+            std::filesystem::create_directories(config_dir);
+            const auto pref_path = config_dir / "ui_scale";
+            std::ofstream file(pref_path);
+            if (file) {
+                file << scale;
+            }
+        } catch (const std::exception& e) {
+            LOG_WARN("Failed to save UI scale preference: {}", e.what());
+        }
+    }
+
+    float loadUiScalePreference() {
+        try {
+            const auto config_dir = getThemeConfigDir();
+            const auto pref_path = config_dir / "ui_scale";
+            if (std::filesystem::exists(pref_path)) {
+                std::ifstream file(pref_path);
+                float scale = 0.0f;
+                if (file >> scale)
+                    return scale;
+            }
+        } catch (const std::exception& e) {
+            LOG_WARN("Failed to load UI scale preference: {}", e.what());
+        }
+        return 0.0f;
+    }
+
+    void setThemeVignetteEnabled(bool enabled) {
+        Theme t = theme();
+        t.vignette.enabled = enabled;
+        applyThemePreservingCurrentId(t);
+    }
+
+    void setThemeVignetteIntensity(float intensity) {
+        Theme t = theme();
+        t.vignette.intensity = std::clamp(intensity, 0.0f, 1.0f);
+        applyThemePreservingCurrentId(t);
+    }
+
+    void setThemeVignetteStyle(float intensity, float radius, float softness) {
+        Theme t = theme();
+        t.vignette.intensity = std::clamp(intensity, 0.0f, 1.0f);
+        t.vignette.radius = std::clamp(radius, 0.0f, 1.0f);
+        t.vignette.softness = std::clamp(softness, 0.0f, 1.0f);
+        applyThemePreservingCurrentId(t);
     }
 
 } // namespace lfs::vis

@@ -1,0 +1,966 @@
+/* SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
+ * SPDX-License-Identifier: GPL-3.0-or-later */
+
+#include "internal/lazy_executor.hpp"
+
+#include "core/cuda_error.hpp"
+#include "core/logger.hpp"
+#include "internal/cuda_stream_context.hpp"
+#include "internal/lazy_config.hpp"
+#include "internal/lazy_ir.hpp"
+#include "internal/tensor_impl.hpp"
+#include "internal/tensor_ops.hpp"
+#include <algorithm>
+#include <atomic>
+#include <cassert>
+#include <cmath>
+#include <iterator>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
+
+namespace lfs::core::internal {
+
+    namespace {
+
+        struct LazyExecutorContext {
+            std::unordered_map<uint64_t, Tensor> cached_materializations;
+        };
+
+        struct DeferredMaterializerRegistry {
+            struct Entry {
+                std::function<Tensor()> materializer;
+                std::weak_ptr<LazyExprState> owner;
+            };
+
+            std::mutex mutex;
+            std::unordered_map<uint64_t, Entry> by_node_id;
+        };
+
+        struct PointwiseFusionRegistry {
+            struct Entry {
+                uint64_t parent_node_id = 0;
+                std::shared_ptr<Tensor> source;
+                std::vector<LazyPointwiseOp> ops;
+                std::weak_ptr<LazyExprState> owner;
+            };
+
+            std::mutex mutex;
+            std::unordered_map<uint64_t, Entry> by_node_id;
+        };
+
+        struct LazyExecutorDiagnosticsCounters {
+            std::atomic<uint64_t> planned_nodes{0};
+            std::atomic<uint64_t> executed_nodes{0};
+            std::atomic<uint64_t> cache_hits{0};
+            std::atomic<uint64_t> cache_misses{0};
+            std::atomic<uint64_t> root_fallbacks{0};
+            std::atomic<uint64_t> fused_launches{0};
+            std::atomic<uint64_t> fused_reduce_launches{0};
+            std::atomic<uint64_t> max_registry_entries{0};
+            std::atomic<uint64_t> max_context_cache_entries{0};
+            std::atomic<uint64_t> early_releases{0};
+            std::atomic<uint64_t> early_release_bytes{0};
+            std::atomic<uint64_t> peak_cache_bytes{0};
+        };
+
+        struct LazyExecutorDebugDumpState {
+            std::atomic<int> override_enabled{-1}; // -1 unset, 0 false, 1 true
+        };
+
+        struct LazyExecutorPointwiseFusionState {
+            std::atomic<int> override_enabled{-1}; // -1 unset, 0 false, 1 true
+        };
+
+        struct LazyExecutorMemoryPlannerState {
+            std::atomic<int> override_enabled{-1}; // -1 unset, 0 false, 1 true
+        };
+
+        DeferredMaterializerRegistry& deferred_materializer_registry() {
+            static DeferredMaterializerRegistry registry;
+            return registry;
+        }
+
+        PointwiseFusionRegistry& pointwise_fusion_registry() {
+            static PointwiseFusionRegistry registry;
+            return registry;
+        }
+
+        LazyExecutorDiagnosticsCounters& lazy_executor_diagnostics_counters() {
+            static LazyExecutorDiagnosticsCounters counters;
+            return counters;
+        }
+
+        LazyExecutorDebugDumpState& lazy_executor_debug_dump_state() {
+            static LazyExecutorDebugDumpState state;
+            return state;
+        }
+
+        LazyExecutorPointwiseFusionState& lazy_executor_pointwise_fusion_state() {
+            static LazyExecutorPointwiseFusionState state;
+            return state;
+        }
+
+        struct LazyExecutorSizeHeuristicState {
+            std::atomic<int> override_enabled{-1};       // -1 unset, 0 false, 1 true
+            std::atomic<int64_t> override_threshold{-1}; // -1 unset
+        };
+
+        constexpr size_t kDefaultLazySizeThreshold = 4096;
+        constexpr size_t kRegistryPruneThreshold = 16;
+
+        LazyExecutorMemoryPlannerState& lazy_executor_memory_planner_state() {
+            static LazyExecutorMemoryPlannerState state;
+            return state;
+        }
+
+        LazyExecutorSizeHeuristicState& lazy_executor_size_heuristic_state() {
+            static LazyExecutorSizeHeuristicState state;
+            return state;
+        }
+
+        thread_local LazyExecutorContext* active_context = nullptr;
+
+        class LazyExecutorContextScope {
+        public:
+            explicit LazyExecutorContextScope(LazyExecutorContext* context)
+                : previous_(active_context) {
+                active_context = context;
+            }
+
+            ~LazyExecutorContextScope() { active_context = previous_; }
+
+            LazyExecutorContextScope(const LazyExecutorContextScope&) = delete;
+            LazyExecutorContextScope& operator=(const LazyExecutorContextScope&) = delete;
+
+        private:
+            LazyExecutorContext* previous_ = nullptr;
+        };
+
+        bool lazy_executor_debug_dump_enabled() {
+            auto& state = lazy_executor_debug_dump_state();
+            const int override_enabled = state.override_enabled.load(std::memory_order_acquire);
+            if (override_enabled == 0 || override_enabled == 1) {
+                return override_enabled == 1;
+            }
+
+            return false;
+        }
+
+        bool lazy_executor_pointwise_fusion_enabled() {
+            const int override_enabled = lazy_executor_pointwise_fusion_state()
+                                             .override_enabled.load(std::memory_order_acquire);
+            if (override_enabled == 0 || override_enabled == 1) {
+                return override_enabled == 1;
+            }
+            return true;
+        }
+
+        bool lazy_executor_memory_planner_enabled() {
+            const int override_enabled = lazy_executor_memory_planner_state()
+                                             .override_enabled.load(std::memory_order_acquire);
+            if (override_enabled == 0 || override_enabled == 1) {
+                return override_enabled == 1;
+            }
+            return true;
+        }
+
+        std::vector<DeferredMaterializerRegistry::Entry>
+        prune_expired_materializers_locked(DeferredMaterializerRegistry& registry) {
+            std::vector<DeferredMaterializerRegistry::Entry> retired;
+            for (auto it = registry.by_node_id.begin(); it != registry.by_node_id.end();) {
+                if (it->second.owner.expired()) {
+                    retired.push_back(std::move(it->second));
+                    it = registry.by_node_id.erase(it);
+                    continue;
+                }
+                ++it;
+            }
+            return retired;
+        }
+
+        std::vector<PointwiseFusionRegistry::Entry>
+        prune_expired_pointwise_fusions_locked(PointwiseFusionRegistry& registry) {
+            std::vector<PointwiseFusionRegistry::Entry> retired;
+            for (auto it = registry.by_node_id.begin(); it != registry.by_node_id.end();) {
+                if (it->second.owner.expired()) {
+                    retired.push_back(std::move(it->second));
+                    it = registry.by_node_id.erase(it);
+                    continue;
+                }
+                ++it;
+            }
+            return retired;
+        }
+
+        bool lookup_registered_materializer(uint64_t node_id, std::function<Tensor()>& materializer) {
+            if (node_id == 0) {
+                return false;
+            }
+            auto& registry = deferred_materializer_registry();
+            std::lock_guard<std::mutex> lock(registry.mutex);
+            const auto it = registry.by_node_id.find(node_id);
+            if (it == registry.by_node_id.end()) {
+                return false;
+            }
+            materializer = it->second.materializer;
+            return static_cast<bool>(materializer);
+        }
+
+        void record_planned_nodes(size_t count) {
+            lazy_executor_diagnostics_counters().planned_nodes.fetch_add(
+                static_cast<uint64_t>(count), std::memory_order_relaxed);
+        }
+
+        void record_executed_node() {
+            lazy_executor_diagnostics_counters().executed_nodes.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        void record_cache_hit() {
+            lazy_executor_diagnostics_counters().cache_hits.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        void record_cache_miss() {
+            lazy_executor_diagnostics_counters().cache_misses.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        void record_root_fallback() {
+            lazy_executor_diagnostics_counters().root_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        void record_fused_launch() {
+            lazy_executor_diagnostics_counters().fused_launches.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        void record_relaxed_max(std::atomic<uint64_t>& target, uint64_t value) {
+            uint64_t current = target.load(std::memory_order_relaxed);
+            while (current < value &&
+                   !target.compare_exchange_weak(current, value, std::memory_order_relaxed)) {
+            }
+        }
+
+        void record_early_release(size_t bytes) {
+            auto& counters = lazy_executor_diagnostics_counters();
+            counters.early_releases.fetch_add(1, std::memory_order_relaxed);
+            counters.early_release_bytes.fetch_add(
+                static_cast<uint64_t>(bytes), std::memory_order_relaxed);
+        }
+
+        void record_peak_cache_bytes(size_t bytes) {
+            record_relaxed_max(lazy_executor_diagnostics_counters().peak_cache_bytes,
+                               static_cast<uint64_t>(bytes));
+        }
+
+        // Maps execution step index → list of node_ids to release from cache after that step.
+        std::unordered_map<size_t, std::vector<uint64_t>>
+        compute_release_schedule(const LazyExecutionPlanDebug& plan,
+                                 const std::unordered_set<uint64_t>& internal_fused_nodes) {
+            std::unordered_map<size_t, std::vector<uint64_t>> schedule;
+            if (plan.topo_nodes.empty() || !plan.has_root) {
+                return schedule;
+            }
+
+            // Build step index for each node_id.
+            std::unordered_map<uint64_t, size_t> node_step;
+            node_step.reserve(plan.topo_nodes.size());
+            for (size_t i = 0; i < plan.topo_nodes.size(); ++i) {
+                node_step[plan.topo_nodes[i].node_id] = i;
+            }
+
+            // For each node, find the last step that consumes it as input.
+            std::unordered_map<uint64_t, size_t> last_consumer_step;
+            for (size_t step = 0; step < plan.topo_nodes.size(); ++step) {
+                if (internal_fused_nodes.find(plan.topo_nodes[step].node_id) != internal_fused_nodes.end()) {
+                    continue;
+                }
+                for (uint64_t input_id : plan.topo_nodes[step].input_ids) {
+                    last_consumer_step[input_id] = step;
+                }
+            }
+
+            // Invert: step → [node_ids to release].
+            for (const auto& [node_id, step] : last_consumer_step) {
+                if (internal_fused_nodes.find(node_id) != internal_fused_nodes.end()) {
+                    continue;
+                }
+                if (node_id == plan.root_node_id) {
+                    continue;
+                }
+                schedule[step].push_back(node_id);
+            }
+
+            return schedule;
+        }
+
+        LazyExecutorDiagnosticsSnapshot diagnostics_delta(const LazyExecutorDiagnosticsSnapshot& before,
+                                                          const LazyExecutorDiagnosticsSnapshot& after) {
+            return LazyExecutorDiagnosticsSnapshot{
+                after.planned_nodes - before.planned_nodes,
+                after.executed_nodes - before.executed_nodes,
+                after.cache_hits - before.cache_hits,
+                after.cache_misses - before.cache_misses,
+                after.root_fallbacks - before.root_fallbacks,
+                after.fused_launches - before.fused_launches,
+                after.fused_reduce_launches - before.fused_reduce_launches,
+                after.max_registry_entries,
+                after.max_context_cache_entries,
+                after.early_releases - before.early_releases,
+                after.early_release_bytes - before.early_release_bytes,
+                after.peak_cache_bytes};
+        }
+
+        struct PointwiseFusionRecipe {
+            uint64_t parent_node_id = 0;
+            std::shared_ptr<Tensor> source;
+            std::vector<LazyPointwiseOp> ops;
+        };
+
+        std::unordered_map<uint64_t, PointwiseFusionRecipe>
+        collect_pointwise_fusion_recipes_for_plan(const LazyExecutionPlanDebug& plan) {
+            std::unordered_map<uint64_t, PointwiseFusionRecipe> recipes;
+            if (!lazy_executor_pointwise_fusion_enabled() || plan.topo_nodes.empty()) {
+                return recipes;
+            }
+
+            auto& registry = pointwise_fusion_registry();
+            std::lock_guard<std::mutex> lock(registry.mutex);
+
+            recipes.reserve(plan.topo_nodes.size());
+            for (const auto& node : plan.topo_nodes) {
+                const auto it = registry.by_node_id.find(node.node_id);
+                if (it == registry.by_node_id.end()) {
+                    continue;
+                }
+                recipes.emplace(node.node_id, PointwiseFusionRecipe{
+                                                  it->second.parent_node_id,
+                                                  it->second.source,
+                                                  it->second.ops});
+            }
+            return recipes;
+        }
+
+        std::unordered_set<uint64_t> collect_internal_fused_nodes(
+            const LazyExecutionPlanDebug& plan,
+            const std::unordered_map<uint64_t, PointwiseFusionRecipe>& recipes) {
+            std::unordered_map<uint64_t, size_t> usage_count;
+            std::unordered_map<uint64_t, uint64_t> last_consumer;
+            for (const auto& node : plan.topo_nodes) {
+                for (uint64_t input_id : node.input_ids) {
+                    usage_count[input_id] += 1;
+                    last_consumer[input_id] = node.node_id;
+                }
+            }
+
+            std::unordered_set<uint64_t> internal_nodes;
+            for (const auto& [node_id, recipe] : recipes) {
+                const auto usage_it = usage_count.find(node_id);
+                if (usage_it == usage_count.end() || usage_it->second != 1) {
+                    continue;
+                }
+                const auto consumer_it = last_consumer.find(node_id);
+                if (consumer_it == last_consumer.end()) {
+                    continue;
+                }
+                const auto consumer_recipe_it = recipes.find(consumer_it->second);
+                if (consumer_recipe_it == recipes.end()) {
+                    continue;
+                }
+                if (consumer_recipe_it->second.parent_node_id != node_id) {
+                    continue;
+                }
+                internal_nodes.insert(node_id);
+            }
+            return internal_nodes;
+        }
+
+        float apply_pointwise_op_cpu(float x, LazyPointwiseOpKind kind, float scalar) {
+            switch (kind) {
+            case LazyPointwiseOpKind::AddScalar: return x + scalar;
+            case LazyPointwiseOpKind::SubScalar: return x - scalar;
+            case LazyPointwiseOpKind::MulScalar: return x * scalar;
+            case LazyPointwiseOpKind::DivScalar: return x / scalar;
+            case LazyPointwiseOpKind::Abs: return std::abs(x);
+            case LazyPointwiseOpKind::Neg: return -x;
+            case LazyPointwiseOpKind::Exp: return std::exp(x);
+            case LazyPointwiseOpKind::Log: return std::log(x);
+            case LazyPointwiseOpKind::Sqrt: return std::sqrt(x);
+            case LazyPointwiseOpKind::Sigmoid: return 1.0f / (1.0f + std::exp(-x));
+            case LazyPointwiseOpKind::Relu:
+                return std::isnan(x) ? x : std::max(x, 0.0f);
+            case LazyPointwiseOpKind::Square: return x * x;
+            case LazyPointwiseOpKind::Tanh: return std::tanh(x);
+            case LazyPointwiseOpKind::Rsqrt: return 1.0f / std::sqrt(x);
+            case LazyPointwiseOpKind::Sign: return float((x > 0) - (x < 0));
+            case LazyPointwiseOpKind::Reciprocal: return 1.0f / x;
+            case LazyPointwiseOpKind::Floor: return std::floor(x);
+            case LazyPointwiseOpKind::Ceil: return std::ceil(x);
+            case LazyPointwiseOpKind::Round: return ops::round_op{}(x);
+            }
+            return x;
+        }
+
+        bool execute_pointwise_fusion_recipe(const PointwiseFusionRecipe& recipe, Tensor& materialized) {
+            if (recipe.ops.empty()) {
+                return false;
+            }
+
+            if (recipe.ops.size() > tensor_ops::FUSED_POINTWISE_MAX_OPS) {
+                return false;
+            }
+
+            if (!recipe.source) {
+                return false;
+            }
+            Tensor source = *recipe.source;
+            if (!source.is_valid() ||
+                source.dtype() != DataType::Float32 ||
+                !source.is_contiguous()) {
+                return false;
+            }
+
+            const size_t n = source.numel();
+            tensor_ops::FusedPointwiseOpChain chain{};
+            chain.num_ops = static_cast<int>(recipe.ops.size());
+            for (int i = 0; i < chain.num_ops; ++i) {
+                chain.ops[i].kind = static_cast<uint8_t>(recipe.ops[i].kind);
+                chain.ops[i].scalar = recipe.ops[i].scalar;
+            }
+
+            if (source.device() == Device::CUDA) {
+                const float* in_ptr = source.ptr<float>();
+                assert(in_ptr != nullptr);
+                const cudaStream_t execution_stream = prepare_inputs_for_stream({&source});
+                CUDAStreamGuard guard(execution_stream);
+                Tensor out = Tensor::empty(source.shape(), Device::CUDA, DataType::Float32);
+                float* out_ptr = out.ptr<float>();
+                assert(out_ptr != nullptr);
+                tensor_ops::launch_fused_pointwise_chain(in_ptr, out_ptr, n, chain, out.stream());
+                materialized = std::move(out);
+                return true;
+            }
+
+            const float* in_ptr = source.ptr<float>();
+            if (in_ptr == nullptr)
+                return false;
+            Tensor out = Tensor::empty(source.shape(), Device::CPU, DataType::Float32);
+            float* out_ptr = out.ptr<float>();
+            if (out_ptr == nullptr)
+                return false;
+            for (size_t i = 0; i < n; ++i) {
+                float val = in_ptr[i];
+                for (int j = 0; j < chain.num_ops; ++j) {
+                    val = apply_pointwise_op_cpu(val, recipe.ops[j].kind, recipe.ops[j].scalar);
+                }
+                out_ptr[i] = val;
+            }
+            materialized = std::move(out);
+            return materialized.is_valid();
+        }
+
+        void execute_topological_nodes(const LazyExecutionPlanDebug& plan) {
+            const auto recipes = collect_pointwise_fusion_recipes_for_plan(plan);
+            const auto internal_nodes = collect_internal_fused_nodes(plan, recipes);
+
+            const bool memory_planner_active = lazy_executor_memory_planner_enabled();
+            std::unordered_map<size_t, std::vector<uint64_t>> release_schedule;
+            std::unordered_map<uint64_t, size_t> node_bytes_map;
+            if (memory_planner_active) {
+                release_schedule = compute_release_schedule(plan, internal_nodes);
+                for (const auto& n : plan.topo_nodes) {
+                    node_bytes_map[n.node_id] = n.buffer_bytes;
+                }
+            }
+
+            size_t current_cache_bytes = 0;
+
+            auto track_cache_insert = [&](size_t bytes) {
+                if (!memory_planner_active)
+                    return;
+                current_cache_bytes += bytes;
+                record_peak_cache_bytes(current_cache_bytes);
+            };
+
+            auto try_release_dead = [&](size_t step) {
+                if (!memory_planner_active)
+                    return;
+                const auto it = release_schedule.find(step);
+                if (it == release_schedule.end())
+                    return;
+                for (uint64_t dead_id : it->second) {
+                    if (active_context->cached_materializations.erase(dead_id)) {
+                        const size_t dead_bytes = node_bytes_map[dead_id];
+                        record_early_release(dead_bytes);
+                        if (current_cache_bytes >= dead_bytes)
+                            current_cache_bytes -= dead_bytes;
+                    }
+                }
+            };
+
+            for (size_t step = 0; step < plan.topo_nodes.size(); ++step) {
+                const auto& node = plan.topo_nodes[step];
+
+                if (internal_nodes.find(node.node_id) != internal_nodes.end()) {
+                    try_release_dead(step);
+                    continue;
+                }
+
+                Tensor cached;
+                if (lazy_executor_lookup_cached_materialization(node.node_id, cached)) {
+                    try_release_dead(step);
+                    continue;
+                }
+
+                const auto recipe_it = recipes.find(node.node_id);
+                if (recipe_it != recipes.end()) {
+                    Tensor fused_materialized;
+                    if (execute_pointwise_fusion_recipe(recipe_it->second, fused_materialized) &&
+                        fused_materialized.is_valid()) {
+                        record_executed_node();
+                        record_fused_launch();
+                        lazy_executor_cache_materialization(node.node_id, fused_materialized);
+                        track_cache_insert(node.buffer_bytes);
+                        try_release_dead(step);
+                        continue;
+                    }
+                }
+
+                std::function<Tensor()> materializer;
+                if (!lookup_registered_materializer(node.node_id, materializer)) {
+                    try_release_dead(step);
+                    continue;
+                }
+
+                record_executed_node();
+                Tensor materialized = materializer();
+                if (materialized.is_valid()) {
+                    lazy_executor_cache_materialization(node.node_id, materialized);
+                    track_cache_insert(node.buffer_bytes);
+                }
+                try_release_dead(step);
+            }
+        }
+
+    } // namespace
+
+    void lazy_executor_register_deferred_materializer(uint64_t node_id,
+                                                      std::function<Tensor()> materializer,
+                                                      std::weak_ptr<LazyExprState> owner) {
+        if (node_id == 0 || !materializer || owner.expired()) {
+            return;
+        }
+        auto& registry = deferred_materializer_registry();
+        std::vector<DeferredMaterializerRegistry::Entry> retired;
+        {
+            std::lock_guard<std::mutex> lock(registry.mutex);
+            auto& slot = registry.by_node_id[node_id];
+            if (slot.materializer) {
+                retired.push_back(std::move(slot));
+            }
+            slot = DeferredMaterializerRegistry::Entry{
+                std::move(materializer),
+                std::move(owner)};
+            record_relaxed_max(lazy_executor_diagnostics_counters().max_registry_entries,
+                               static_cast<uint64_t>(registry.by_node_id.size()));
+            if (registry.by_node_id.size() >= kRegistryPruneThreshold) {
+                auto expired = prune_expired_materializers_locked(registry);
+                std::move(expired.begin(), expired.end(), std::back_inserter(retired));
+            }
+        }
+    }
+
+    std::shared_ptr<Tensor> lazy_executor_snapshot_operand(const Tensor& source) {
+        return source.create_lazy_snapshot();
+    }
+
+    void lazy_executor_register_pointwise_fusion_op(uint64_t node_id,
+                                                    uint64_t parent_node_id,
+                                                    const Tensor& source_tensor,
+                                                    LazyPointwiseOp op,
+                                                    std::weak_ptr<LazyExprState> owner) {
+        if (!lazy_executor_pointwise_fusion_enabled() ||
+            node_id == 0 ||
+            owner.expired()) {
+            return;
+        }
+
+        auto& registry = pointwise_fusion_registry();
+        std::vector<PointwiseFusionRegistry::Entry> retired;
+        {
+            std::lock_guard<std::mutex> lock(registry.mutex);
+
+            PointwiseFusionRegistry::Entry entry;
+            entry.parent_node_id = parent_node_id;
+            entry.owner = std::move(owner);
+
+            if (parent_node_id != 0) {
+                const auto parent_it = registry.by_node_id.find(parent_node_id);
+                if (parent_it != registry.by_node_id.end()) {
+                    entry.source = parent_it->second.source;
+                    entry.ops = parent_it->second.ops;
+                }
+            }
+            if (!entry.source || !entry.source->is_valid()) {
+                entry.source = lazy_executor_snapshot_operand(source_tensor);
+            }
+            entry.ops.push_back(op);
+            auto& slot = registry.by_node_id[node_id];
+            if (slot.source || !slot.ops.empty()) {
+                retired.push_back(std::move(slot));
+            }
+            slot = std::move(entry);
+            if (registry.by_node_id.size() >= kRegistryPruneThreshold) {
+                auto expired = prune_expired_pointwise_fusions_locked(registry);
+                std::move(expired.begin(), expired.end(), std::back_inserter(retired));
+            }
+        }
+    }
+
+    void lazy_executor_unregister_deferred_materializer(uint64_t node_id) {
+        if (node_id == 0) {
+            return;
+        }
+        std::vector<DeferredMaterializerRegistry::Entry> retired_materializers;
+        auto& registry = deferred_materializer_registry();
+        {
+            std::lock_guard<std::mutex> lock(registry.mutex);
+            const auto it = registry.by_node_id.find(node_id);
+            if (it != registry.by_node_id.end()) {
+                retired_materializers.push_back(std::move(it->second));
+                registry.by_node_id.erase(it);
+            }
+            auto expired = prune_expired_materializers_locked(registry);
+            std::move(expired.begin(), expired.end(),
+                      std::back_inserter(retired_materializers));
+        }
+
+        std::vector<PointwiseFusionRegistry::Entry> retired_fusions;
+        auto& fusion_registry = pointwise_fusion_registry();
+        {
+            std::lock_guard<std::mutex> fusion_lock(fusion_registry.mutex);
+            const auto it = fusion_registry.by_node_id.find(node_id);
+            if (it != fusion_registry.by_node_id.end()) {
+                retired_fusions.push_back(std::move(it->second));
+                fusion_registry.by_node_id.erase(it);
+            }
+            auto expired = prune_expired_pointwise_fusions_locked(fusion_registry);
+            std::move(expired.begin(), expired.end(),
+                      std::back_inserter(retired_fusions));
+        }
+    }
+
+    size_t lazy_executor_registered_node_count_for_testing() {
+        auto& registry = deferred_materializer_registry();
+        std::vector<DeferredMaterializerRegistry::Entry> retired;
+        size_t count = 0;
+        {
+            std::lock_guard<std::mutex> lock(registry.mutex);
+            retired = prune_expired_materializers_locked(registry);
+            count = registry.by_node_id.size();
+        }
+        return count;
+    }
+
+    void lazy_executor_clear_registry_for_testing() {
+        decltype(DeferredMaterializerRegistry::by_node_id) retired_materializers;
+        auto& registry = deferred_materializer_registry();
+        {
+            std::lock_guard<std::mutex> lock(registry.mutex);
+            retired_materializers.swap(registry.by_node_id);
+        }
+
+        decltype(PointwiseFusionRegistry::by_node_id) retired_fusions;
+        auto& fusion_registry = pointwise_fusion_registry();
+        {
+            std::lock_guard<std::mutex> fusion_lock(fusion_registry.mutex);
+            retired_fusions.swap(fusion_registry.by_node_id);
+        }
+    }
+
+    bool lazy_executor_context_active() {
+        return active_context != nullptr;
+    }
+
+    bool lazy_executor_lookup_cached_materialization(uint64_t node_id, Tensor& materialized) {
+        if (node_id == 0 || active_context == nullptr) {
+            return false;
+        }
+        const auto it = active_context->cached_materializations.find(node_id);
+        if (it == active_context->cached_materializations.end()) {
+            record_cache_miss();
+            return false;
+        }
+        record_cache_hit();
+        materialized = it->second;
+        return true;
+    }
+
+    void lazy_executor_cache_materialization(uint64_t node_id, const Tensor& materialized) {
+        if (node_id == 0 || active_context == nullptr || !materialized.is_valid()) {
+            return;
+        }
+        active_context->cached_materializations.insert_or_assign(node_id, materialized);
+        record_relaxed_max(
+            lazy_executor_diagnostics_counters().max_context_cache_entries,
+            static_cast<uint64_t>(active_context->cached_materializations.size()));
+    }
+
+    LazyExecutionPlanDebug lazy_planner_build_plan_for_tensor(const Tensor& output) {
+        LazyExecutionPlanDebug plan;
+        plan.planner_enabled = true;
+
+        const uint64_t root_id = output.lazy_expr_id();
+        if (root_id == 0) {
+            return plan;
+        }
+
+        plan.has_root = true;
+        plan.root_node_id = root_id;
+
+        const auto topo = lazy_ir_collect_topological_subgraph(root_id);
+        for (const auto& node : topo) {
+            plan.topo_nodes.push_back(
+                LazyPlanNodeDebug{node.node_id, node.op_name, node.input_ids, node.buffer_bytes});
+        }
+
+        if (plan.topo_nodes.empty()) {
+            const auto root_info = lazy_ir_node_info(root_id);
+            if (root_info.has_value()) {
+                plan.topo_nodes.push_back(LazyPlanNodeDebug{
+                    root_info->node_id, root_info->op_name, root_info->input_ids, root_info->buffer_bytes});
+            }
+        }
+        return plan;
+    }
+
+    Tensor lazy_planner_execute_plan_for_tensor(const Tensor& output,
+                                                std::function<Tensor()> materializer) {
+        if (!materializer) {
+            throw std::runtime_error("lazy_planner_execute_plan_for_tensor: materializer is empty");
+        }
+
+        const bool emit_debug_dump = (active_context == nullptr) && lazy_executor_debug_dump_enabled();
+        LazyExecutorDiagnosticsSnapshot diagnostics_before{};
+        if (emit_debug_dump) {
+            diagnostics_before = lazy_executor_diagnostics_snapshot_for_testing();
+        }
+
+        // Build plan and execute registered deferred nodes in topological order.
+        const LazyExecutionPlanDebug plan = lazy_planner_build_plan_for_tensor(output);
+        record_planned_nodes(plan.topo_nodes.size());
+
+        auto maybe_emit_debug_dump = [&](const Tensor& result, const char* root_source) {
+            if (!emit_debug_dump) {
+                return;
+            }
+            const auto diagnostics_after = lazy_executor_diagnostics_snapshot_for_testing();
+            const auto delta = diagnostics_delta(diagnostics_before, diagnostics_after);
+            LOG_INFO(
+                "lazy-exec root={} source={} planned={} executed={} fused={} cache_hit={} cache_miss={} root_fallback={} reg_peak={} ctx_peak={} early_rel={} early_rel_bytes={} peak_cache_bytes={} result_valid={}",
+                plan.root_node_id,
+                root_source,
+                delta.planned_nodes,
+                delta.executed_nodes,
+                delta.fused_launches,
+                delta.cache_hits,
+                delta.cache_misses,
+                delta.root_fallbacks,
+                delta.max_registry_entries,
+                delta.max_context_cache_entries,
+                delta.early_releases,
+                delta.early_release_bytes,
+                delta.peak_cache_bytes,
+                result.is_valid());
+        };
+
+        if (active_context != nullptr) {
+            execute_topological_nodes(plan);
+
+            if (plan.has_root) {
+                Tensor cached;
+                if (lazy_executor_lookup_cached_materialization(plan.root_node_id, cached)) {
+                    return cached;
+                }
+            }
+            Tensor result = materializer();
+            if (plan.has_root && result.is_valid()) {
+                lazy_executor_cache_materialization(plan.root_node_id, result);
+            }
+            record_root_fallback();
+            return result;
+        }
+
+        LazyExecutorContext local_context;
+        local_context.cached_materializations.reserve(
+            std::max<size_t>(plan.topo_nodes.size(), static_cast<size_t>(4)));
+        LazyExecutorContextScope context_scope(&local_context);
+
+        execute_topological_nodes(plan);
+        if (plan.has_root) {
+            Tensor cached;
+            if (lazy_executor_lookup_cached_materialization(plan.root_node_id, cached)) {
+                maybe_emit_debug_dump(cached, "cache");
+                return cached;
+            }
+        }
+
+        Tensor result = materializer();
+        if (plan.has_root && result.is_valid()) {
+            lazy_executor_cache_materialization(plan.root_node_id, result);
+        }
+        record_root_fallback();
+        maybe_emit_debug_dump(result, "fallback");
+        return result;
+    }
+
+    void lazy_executor_reset_diagnostics_for_testing() {
+        auto& diagnostics = lazy_executor_diagnostics_counters();
+        diagnostics.planned_nodes.store(0, std::memory_order_relaxed);
+        diagnostics.executed_nodes.store(0, std::memory_order_relaxed);
+        diagnostics.cache_hits.store(0, std::memory_order_relaxed);
+        diagnostics.cache_misses.store(0, std::memory_order_relaxed);
+        diagnostics.root_fallbacks.store(0, std::memory_order_relaxed);
+        diagnostics.fused_launches.store(0, std::memory_order_relaxed);
+        diagnostics.fused_reduce_launches.store(0, std::memory_order_relaxed);
+        diagnostics.max_registry_entries.store(0, std::memory_order_relaxed);
+        diagnostics.max_context_cache_entries.store(0, std::memory_order_relaxed);
+        diagnostics.early_releases.store(0, std::memory_order_relaxed);
+        diagnostics.early_release_bytes.store(0, std::memory_order_relaxed);
+        diagnostics.peak_cache_bytes.store(0, std::memory_order_relaxed);
+    }
+
+    LazyExecutorDiagnosticsSnapshot lazy_executor_diagnostics_snapshot_for_testing() {
+        const auto& diagnostics = lazy_executor_diagnostics_counters();
+        return LazyExecutorDiagnosticsSnapshot{
+            diagnostics.planned_nodes.load(std::memory_order_relaxed),
+            diagnostics.executed_nodes.load(std::memory_order_relaxed),
+            diagnostics.cache_hits.load(std::memory_order_relaxed),
+            diagnostics.cache_misses.load(std::memory_order_relaxed),
+            diagnostics.root_fallbacks.load(std::memory_order_relaxed),
+            diagnostics.fused_launches.load(std::memory_order_relaxed),
+            diagnostics.fused_reduce_launches.load(std::memory_order_relaxed),
+            diagnostics.max_registry_entries.load(std::memory_order_relaxed),
+            diagnostics.max_context_cache_entries.load(std::memory_order_relaxed),
+            diagnostics.early_releases.load(std::memory_order_relaxed),
+            diagnostics.early_release_bytes.load(std::memory_order_relaxed),
+            diagnostics.peak_cache_bytes.load(std::memory_order_relaxed)};
+    }
+
+    void lazy_executor_set_debug_dump_override_for_testing(std::optional<bool> enabled) {
+        auto& state = lazy_executor_debug_dump_state();
+        if (enabled.has_value()) {
+            state.override_enabled.store(*enabled ? 1 : 0, std::memory_order_release);
+            return;
+        }
+        state.override_enabled.store(-1, std::memory_order_release);
+    }
+
+    bool lazy_executor_debug_dump_enabled_for_testing() {
+        return lazy_executor_debug_dump_enabled();
+    }
+
+    void lazy_executor_set_pointwise_fusion_override_for_testing(std::optional<bool> enabled) {
+        auto& state = lazy_executor_pointwise_fusion_state();
+        if (enabled.has_value()) {
+            state.override_enabled.store(*enabled ? 1 : 0, std::memory_order_release);
+            return;
+        }
+        state.override_enabled.store(-1, std::memory_order_release);
+    }
+
+    bool lazy_executor_pointwise_fusion_enabled_for_testing() {
+        return lazy_executor_pointwise_fusion_enabled();
+    }
+
+    void lazy_executor_diagnostics_counters_increment_fused() {
+        lazy_executor_diagnostics_counters().fused_launches.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void lazy_executor_diagnostics_counters_increment_fused_reduce() {
+        lazy_executor_diagnostics_counters().fused_reduce_launches.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void lazy_executor_set_memory_planner_override_for_testing(std::optional<bool> enabled) {
+        auto& state = lazy_executor_memory_planner_state();
+        if (enabled.has_value()) {
+            state.override_enabled.store(*enabled ? 1 : 0, std::memory_order_release);
+            return;
+        }
+        state.override_enabled.store(-1, std::memory_order_release);
+    }
+
+    bool lazy_executor_memory_planner_enabled_for_testing() {
+        return lazy_executor_memory_planner_enabled();
+    }
+
+    void lazy_executor_set_size_heuristic_override_for_testing(std::optional<bool> enabled) {
+        auto& state = lazy_executor_size_heuristic_state();
+        if (enabled.has_value()) {
+            state.override_enabled.store(*enabled ? 1 : 0, std::memory_order_release);
+            return;
+        }
+        state.override_enabled.store(-1, std::memory_order_release);
+    }
+
+    void lazy_executor_set_size_threshold_override_for_testing(std::optional<size_t> threshold) {
+        auto& state = lazy_executor_size_heuristic_state();
+        if (threshold.has_value()) {
+            state.override_threshold.store(static_cast<int64_t>(*threshold), std::memory_order_release);
+            return;
+        }
+        state.override_threshold.store(-1, std::memory_order_release);
+    }
+
+    size_t lazy_executor_size_heuristic_threshold() {
+        auto& state = lazy_executor_size_heuristic_state();
+
+        const int64_t override_threshold = state.override_threshold.load(std::memory_order_acquire);
+        if (override_threshold >= 0) {
+            return static_cast<size_t>(override_threshold);
+        }
+
+        return kDefaultLazySizeThreshold;
+    }
+
+    bool lazy_size_heuristic_should_defer(size_t byte_count) {
+        auto& state = lazy_executor_size_heuristic_state();
+
+        const int override_enabled = state.override_enabled.load(std::memory_order_acquire);
+        if (override_enabled == 0) {
+            return true;
+        }
+
+        return byte_count >= lazy_executor_size_heuristic_threshold();
+    }
+
+    bool lazy_executor_try_consume_pointwise_fusion(
+        uint64_t node_id, Tensor* out_source, std::vector<LazyPointwiseOp>* out_ops) {
+        assert(out_source != nullptr);
+        assert(out_ops != nullptr);
+
+        if (node_id == 0 || !lazy_executor_pointwise_fusion_enabled()) {
+            return false;
+        }
+
+        auto& registry = pointwise_fusion_registry();
+        PointwiseFusionRegistry::Entry consumed;
+        {
+            std::lock_guard<std::mutex> lock(registry.mutex);
+            const auto it = registry.by_node_id.find(node_id);
+            if (it == registry.by_node_id.end()) {
+                return false;
+            }
+            consumed = std::move(it->second);
+            registry.by_node_id.erase(it);
+        }
+
+        if (!consumed.source) {
+            return false;
+        }
+        *out_source = *consumed.source;
+        *out_ops = std::move(consumed.ops);
+        return true;
+    }
+
+} // namespace lfs::core::internal

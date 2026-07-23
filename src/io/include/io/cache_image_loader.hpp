@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "core/export.hpp"
 #include <chrono>
 #include <filesystem>
 #include <memory>
@@ -15,7 +16,8 @@
 
 namespace lfs::core {
     class Tensor;
-}
+    struct UndistortParams;
+} // namespace lfs::core
 
 namespace lfs::io {
 
@@ -38,6 +40,8 @@ namespace lfs::io {
         int resize_factor = 1;
         int max_width = 0;
         void* cuda_stream = nullptr;
+        const lfs::core::UndistortParams* undistort = nullptr;
+        bool output_uint8 = false;
     };
 
     struct CachedImageData {
@@ -57,7 +61,7 @@ namespace lfs::io {
         std::chrono::steady_clock::time_point last_access;
     };
 
-    class CacheLoader {
+    class LFS_IO_API CacheLoader {
     public:
         enum class CacheMode { Undetermined,
                                NoCache,
@@ -97,7 +101,10 @@ namespace lfs::io {
         [[nodiscard]] lfs::core::Tensor load_cached_image_from_fs(const std::filesystem::path& path, const LoadParams& params);
         [[nodiscard]] lfs::core::Tensor load_jpeg_with_hardware_decode(const std::filesystem::path& path, const LoadParams& params);
 
-        [[nodiscard]] std::string generate_cache_key(const std::filesystem::path& path, const LoadParams& params) const;
+        [[nodiscard]] std::string generate_cache_key(
+            const std::filesystem::path& path,
+            const LoadParams& params,
+            bool include_output_format) const;
         [[nodiscard]] bool has_sufficient_memory(std::size_t required_bytes) const;
         [[nodiscard]] std::size_t get_cpu_cache_size() const;
         [[nodiscard]] std::size_t get_jpeg_blob_cache_size() const;

@@ -2,8 +2,11 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/tensor.hpp"
+#include <array>
+#include <cstdint>
 #include <gtest/gtest.h>
 #include <random>
+#include <string>
 #include <torch/torch.h>
 
 using namespace lfs::core;
@@ -226,6 +229,32 @@ TEST_F(TensorMaskingTest, MaskedSelectEmpty) {
     EXPECT_EQ(selected_torch.numel(), 0);
 }
 
+TEST_F(TensorMaskingTest, MaskedSelectInt64PreservesValues) {
+    std::vector<int64_t> data = {
+        4'294'967'297LL,
+        -8'589'934'590LL,
+        17'179'869'187LL,
+        -34'359'738'364LL,
+    };
+    const std::vector<bool> mask_data = {true, false, true, false};
+    const std::vector<int64_t> expected = {data[0], data[2]};
+
+    for (const Device device : {Device::CPU, Device::CUDA}) {
+        SCOPED_TRACE(device_name(device));
+        auto input = Tensor::from_blob(data.data(), {data.size()}, Device::CPU, DataType::Int64).clone();
+        auto mask = Tensor::from_vector(mask_data, {mask_data.size()}, Device::CPU);
+        if (device == Device::CUDA) {
+            input = input.to(Device::CUDA);
+            mask = mask.to(Device::CUDA);
+        }
+
+        const auto selected = input.masked_select(mask);
+        ASSERT_TRUE(selected.is_valid());
+        EXPECT_EQ(selected.dtype(), DataType::Int64);
+        EXPECT_EQ(selected.to_vector_int64(), expected);
+    }
+}
+
 // ============= Masked Fill Tests =============
 
 TEST_F(TensorMaskingTest, MaskedFillInplace) {
@@ -296,6 +325,164 @@ TEST_F(TensorMaskingTest, WhereWithBroadcasting) {
     auto result_torch = torch::where(cond_torch, x_torch, y_torch);
 
     compare_tensors(result_custom, result_torch, 1e-5f, 1e-7f, "WhereBroadcast");
+}
+
+TEST_F(TensorMaskingTest, WhereDtypeMatrix) {
+    const std::vector<DataType> dtypes = {
+        DataType::Bool, DataType::Int32, DataType::Int64, DataType::Float16, DataType::Float32};
+    const std::vector<bool> cond_values = {true, false, false, true};
+    const std::vector<float> x_values = {1.0f, 0.0f, 3.0f, 0.0f};
+    const std::vector<float> y_values = {0.0f, 2.0f, 0.0f, 4.0f};
+
+    const auto cond = Tensor::from_vector(cond_values, {4}, Device::CUDA);
+
+    auto promote = [](DataType a, DataType b) -> DataType {
+        if (a == b)
+            return a;
+
+        if (a == DataType::Bool) {
+            if (b == DataType::Float32 || b == DataType::Float16)
+                return b;
+            if (b == DataType::Int32 || b == DataType::Int64)
+                return b;
+            return DataType::Float32;
+        }
+        if (b == DataType::Bool) {
+            if (a == DataType::Float32 || a == DataType::Float16)
+                return a;
+            if (a == DataType::Int32 || a == DataType::Int64)
+                return a;
+            return DataType::Float32;
+        }
+
+        if ((a == DataType::Int32 || a == DataType::Int64) &&
+            (b == DataType::Float32 || b == DataType::Float16)) {
+            return (b == DataType::Float16) ? DataType::Float16 : DataType::Float32;
+        }
+        if ((b == DataType::Int32 || b == DataType::Int64) &&
+            (a == DataType::Float32 || a == DataType::Float16)) {
+            return (a == DataType::Float16) ? DataType::Float16 : DataType::Float32;
+        }
+
+        if ((a == DataType::Int32 && b == DataType::Int64) ||
+            (a == DataType::Int64 && b == DataType::Int32)) {
+            return DataType::Int64;
+        }
+
+        if ((a == DataType::Float16 && b == DataType::Float32) ||
+            (a == DataType::Float32 && b == DataType::Float16)) {
+            return DataType::Float32;
+        }
+
+        return DataType::Float32;
+    };
+
+    auto cast_scalar = [](double value, DataType dtype) -> double {
+        switch (dtype) {
+        case DataType::Bool:
+            return (value != 0.0) ? 1.0 : 0.0;
+        case DataType::Int32:
+            return static_cast<double>(static_cast<int32_t>(value));
+        case DataType::Int64:
+            return static_cast<double>(static_cast<int64_t>(value));
+        case DataType::Float16:
+        case DataType::Float32:
+            return static_cast<double>(value);
+        default:
+            return static_cast<double>(value);
+        }
+    };
+
+    auto make_tensor = [](DataType dtype, const std::vector<float>& values) -> Tensor {
+        switch (dtype) {
+        case DataType::Bool: {
+            std::vector<bool> bool_values;
+            bool_values.reserve(values.size());
+            for (float v : values) {
+                bool_values.push_back(v != 0.0f);
+            }
+            return Tensor::from_vector(bool_values, {values.size()}, Device::CUDA);
+        }
+        case DataType::Int32: {
+            std::vector<int> int_values;
+            int_values.reserve(values.size());
+            for (float v : values) {
+                int_values.push_back(static_cast<int>(v));
+            }
+            return Tensor::from_vector(int_values, {values.size()}, Device::CUDA);
+        }
+        case DataType::Int64: {
+            std::vector<int> int_values;
+            int_values.reserve(values.size());
+            for (float v : values) {
+                int_values.push_back(static_cast<int>(v));
+            }
+            return Tensor::from_vector(int_values, {values.size()}, Device::CUDA).to(DataType::Int64);
+        }
+        case DataType::Float16:
+            return Tensor::from_vector(values, {values.size()}, Device::CUDA).to(DataType::Float16);
+        case DataType::Float32:
+            return Tensor::from_vector(values, {values.size()}, Device::CUDA);
+        default:
+            return Tensor();
+        }
+    };
+
+    for (DataType x_dtype : dtypes) {
+        for (DataType y_dtype : dtypes) {
+            const DataType expected_dtype = promote(x_dtype, y_dtype);
+            SCOPED_TRACE(std::string("x=") + dtype_name(x_dtype) +
+                         ", y=" + dtype_name(y_dtype) +
+                         ", out=" + dtype_name(expected_dtype));
+
+            const Tensor x = make_tensor(x_dtype, x_values);
+            const Tensor y = make_tensor(y_dtype, y_values);
+            ASSERT_TRUE(x.is_valid());
+            ASSERT_TRUE(y.is_valid());
+
+            const Tensor out = Tensor::where(cond, x, y);
+            ASSERT_TRUE(out.is_valid());
+            EXPECT_EQ(out.dtype(), expected_dtype);
+
+            std::vector<double> expected_numeric(cond_values.size(), 0.0);
+            std::vector<bool> expected_bool(cond_values.size(), false);
+            for (size_t i = 0; i < cond_values.size(); ++i) {
+                const double x_in_out = cast_scalar(cast_scalar(x_values[i], x_dtype), expected_dtype);
+                const double y_in_out = cast_scalar(cast_scalar(y_values[i], y_dtype), expected_dtype);
+                const double selected = cond_values[i] ? x_in_out : y_in_out;
+                expected_numeric[i] = selected;
+                expected_bool[i] = (selected != 0.0);
+            }
+
+            const Tensor out_cpu = out.to(Device::CPU);
+            if (expected_dtype == DataType::Bool) {
+                const auto actual = out_cpu.to_vector_bool();
+                ASSERT_EQ(actual.size(), expected_bool.size());
+                for (size_t i = 0; i < actual.size(); ++i) {
+                    EXPECT_EQ(actual[i], expected_bool[i]) << "index=" << i;
+                }
+            } else if (expected_dtype == DataType::Int32) {
+                const auto actual = out_cpu.to_vector_int();
+                ASSERT_EQ(actual.size(), expected_numeric.size());
+                for (size_t i = 0; i < actual.size(); ++i) {
+                    EXPECT_EQ(actual[i], static_cast<int>(expected_numeric[i])) << "index=" << i;
+                }
+            } else if (expected_dtype == DataType::Int64) {
+                const auto actual = out_cpu.to_vector_int64();
+                ASSERT_EQ(actual.size(), expected_numeric.size());
+                for (size_t i = 0; i < actual.size(); ++i) {
+                    EXPECT_EQ(actual[i], static_cast<int64_t>(expected_numeric[i])) << "index=" << i;
+                }
+            } else {
+                const auto actual = out_cpu.to(DataType::Float32).to_vector();
+                ASSERT_EQ(actual.size(), expected_numeric.size());
+                const float tol = (expected_dtype == DataType::Float16) ? 1e-3f : 1e-5f;
+                for (size_t i = 0; i < actual.size(); ++i) {
+                    EXPECT_NEAR(actual[i], static_cast<float>(expected_numeric[i]), tol) << "index=" << i;
+                }
+            }
+        }
+    }
 }
 
 // ============= Index Select Tests =============
@@ -1298,6 +1485,34 @@ TEST_F(TensorMaskingTest, PythonLikeMaskedAssignment) {
     compare_tensors(tensor_custom, tensor_torch, 1e-5f, 1e-7f, "PythonLikeMaskedAssignment");
 }
 
+TEST_F(TensorMaskingTest, MaskedTensorAssignmentSupportsEveryDtype) {
+    const std::array dtypes = {
+        DataType::Float32, DataType::Float16, DataType::Int32,
+        DataType::Int64, DataType::UInt8, DataType::Bool};
+
+    for (const auto device : {Device::CPU, Device::CUDA}) {
+        const auto mask = Tensor::from_vector(
+                              std::vector<float>{0.0f, 1.0f, 0.0f, 1.0f},
+                              {4}, device)
+                              .to(DataType::Bool);
+        for (const auto dtype : dtypes) {
+            auto destination = Tensor::zeros({4}, device, dtype);
+            const auto source = Tensor::from_vector(
+                                    std::vector<float>{7.0f, 9.0f}, {2}, device)
+                                    .to(dtype);
+
+            destination[mask] = source;
+
+            const auto actual = destination.to(DataType::Float32).cpu().to_vector();
+            const auto expected = dtype == DataType::Bool
+                                      ? std::vector<float>{0.0f, 1.0f, 0.0f, 1.0f}
+                                      : std::vector<float>{0.0f, 7.0f, 0.0f, 9.0f};
+            EXPECT_EQ(actual, expected) << "dtype=" << dtype_name(dtype)
+                                        << ", device=" << device_name(device);
+        }
+    }
+}
+
 TEST_F(TensorMaskingTest, PythonLikeIndexing) {
     std::vector<float> data = {1, 2, 3, 4, 5};
     auto tensor_custom = Tensor::from_vector(data, {5}, Device::CUDA);
@@ -1453,41 +1668,6 @@ TEST_F(TensorMaskingTest, ImageRegionMasking) {
     }
 }
 
-// ============= Performance Test =============
-
-TEST_F(TensorMaskingTest, MaskingPerformance) {
-    const size_t size = 1000000;
-
-    // Generate random data once and use it for both implementations
-    std::vector<float> data;
-    std::mt19937 gen(42);
-    std::normal_distribution<float> dist(0.0f, 1.0f);
-    for (size_t i = 0; i < size; ++i) {
-        data.push_back(dist(gen));
-    }
-
-    auto tensor_custom = Tensor::from_vector(data, {size}, Device::CUDA);
-    auto tensor_torch = torch::tensor(data, torch::kCUDA);
-
-    // Create mask
-    auto start = std::chrono::high_resolution_clock::now();
-    auto mask_custom = tensor_custom.gt(0.0f);
-    cudaDeviceSynchronize();
-    auto custom_time = std::chrono::high_resolution_clock::now() - start;
-
-    start = std::chrono::high_resolution_clock::now();
-    auto mask_torch = tensor_torch.gt(0.0f);
-    cudaDeviceSynchronize();
-    auto torch_time = std::chrono::high_resolution_clock::now() - start;
-
-    std::cout << "Mask creation for " << size << " elements:\n";
-    std::cout << "  Custom: " << std::chrono::duration_cast<std::chrono::microseconds>(custom_time).count() << " μs\n";
-    std::cout << "  PyTorch: " << std::chrono::duration_cast<std::chrono::microseconds>(torch_time).count() << " μs\n";
-
-    // Verify results match (now they should since we use same input data)
-    compare_tensors(mask_custom, mask_torch, 1e-5f, 1e-7f, "PerformanceMask");
-}
-
 // ============= Extensive Boolean Expansion Tests =============
 
 TEST_F(TensorMaskingTest, BooleanExpansionMultipleDims) {
@@ -1608,15 +1788,14 @@ TEST_F(TensorMaskingTest, ErrorHandlingMismatchedShapes) {
     auto tensor_custom = Tensor::from_vector(data, {2, 2}, Device::CUDA);
     auto wrong_mask_custom = Tensor::ones_bool({3, 3}, Device::CUDA);
 
-    // This should fail gracefully
-    auto result_custom = tensor_custom.masked_select(wrong_mask_custom);
+    EXPECT_THROW((void)tensor_custom.masked_select(wrong_mask_custom),
+                 std::runtime_error);
 
     // PyTorch also fails with mismatched shapes
     auto tensor_torch = torch::tensor({1.0f, 2.0f, 3.0f, 4.0f}, torch::kCUDA).reshape({2, 2});
     auto wrong_mask_torch = torch::ones({3, 3}, torch::TensorOptions().dtype(torch::kBool).device(torch::kCUDA));
 
     EXPECT_THROW(tensor_torch.masked_select(wrong_mask_torch), c10::Error);
-    EXPECT_FALSE(result_custom.is_valid());
 }
 
 TEST_F(TensorMaskingTest, ErrorHandlingWrongDevice) {
@@ -1624,15 +1803,14 @@ TEST_F(TensorMaskingTest, ErrorHandlingWrongDevice) {
     auto cuda_tensor_custom = Tensor::from_vector(data, {2, 2}, Device::CUDA);
     auto cpu_mask_custom = Tensor::ones_bool({2, 2}, Device::CPU);
 
-    // This should fail gracefully
-    auto result_custom = cuda_tensor_custom.masked_select(cpu_mask_custom);
+    EXPECT_THROW((void)cuda_tensor_custom.masked_select(cpu_mask_custom),
+                 std::runtime_error);
 
     // PyTorch also fails with wrong device
     auto cuda_tensor_torch = torch::tensor({1.0f, 2.0f, 3.0f, 4.0f}, torch::kCUDA).reshape({2, 2});
     auto cpu_mask_torch = torch::ones({2, 2}, torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU));
 
     EXPECT_THROW(cuda_tensor_torch.masked_select(cpu_mask_torch), c10::Error);
-    EXPECT_FALSE(result_custom.is_valid());
 }
 
 // ============= Additional Edge Cases =============

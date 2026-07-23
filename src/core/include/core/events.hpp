@@ -3,13 +3,17 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #pragma once
-#include "core/event_bus.hpp"
+#include "core/error_envelope.hpp"
+#include "core/event_bridge/event_bridge.hpp"
 #include "geometry/bounding_box.hpp"
+#include <cstdint>
 #include <filesystem>
 #include <glm/glm.hpp>
 #include <optional>
 #include <string>
 #include <unordered_map>
+
+class Viewport;
 
 namespace lfs::core {
 
@@ -17,23 +21,27 @@ namespace lfs::core {
     class Scene;
 
     // Export format enum
-    enum class ExportFormat { PLY,
-                              SOG,
-                              SPZ,
-                              HTML_VIEWER };
+    enum class ExportFormat { PLY = 0,
+                              SOG = 1,
+                              SPZ = 2,
+                              HTML_VIEWER = 3,
+                              USD = 4,
+                              NUREC_USDZ = 5,
+                              RAD = 6,
+                              COLMAP = 7 };
 
-// Clean event macro - uses lfs::core::event::bus()
+// Event macro using shared event bridge (solves singleton duplication between exe and Python module)
 #define EVENT(Name, ...)                                   \
     struct Name {                                          \
         using event_id = Name;                             \
         __VA_ARGS__                                        \
                                                            \
         void emit() const {                                \
-            ::lfs::core::event::bus().emit(*this);         \
+            ::lfs::event::emit(*this);                     \
         }                                                  \
                                                            \
         static auto when(auto&& handler) {                 \
-            return ::lfs::core::event::bus().when<Name>(   \
+            return ::lfs::event::when<Name>(               \
                 std::forward<decltype(handler)>(handler)); \
         }                                                  \
     }
@@ -51,42 +59,59 @@ namespace lfs::core {
             EVENT(ResetTraining, );
             EVENT(SwitchToLatestCheckpoint, );
             EVENT(SaveCheckpoint, std::optional<int> iteration;);
-            EVENT(LoadFile, std::filesystem::path path; bool is_dataset;);
+            EVENT(LoadFile, std::filesystem::path path; bool is_dataset; std::filesystem::path output_path; std::filesystem::path init_path; std::string centralize_dataset; std::optional<int> max_width; std::optional<int> min_track_length; bool apply_auto_crop = false;);
             EVENT(LoadCheckpointForTraining, std::filesystem::path checkpoint_path; std::filesystem::path dataset_path; std::filesystem::path output_path;);
+            EVENT(ImportColmapCameras, std::filesystem::path sparse_path;);
             EVENT(LoadConfigFile, std::filesystem::path path;);
             EVENT(ShowDatasetLoadPopup, std::filesystem::path dataset_path;);
+            EVENT(ShowVideoExtractor, std::filesystem::path video_path;);
             EVENT(ShowResumeCheckpointPopup, std::filesystem::path checkpoint_path;);
-            EVENT(ClearScene, );
-            EVENT(SwitchToEditMode, ); // Keep trained model, discard dataset
+            EVENT(NewProject, );
+            EVENT(RequestExit, );
+            EVENT(ForceExit, );
+            EVENT(SwitchToEditMode, );
             EVENT(ResetCamera, );
             EVENT(ShowWindow, std::string window_name; bool show;);
             EVENT(ExecuteConsole, std::string command;);
             EVENT(GoToCamView, int cam_id;);
+            EVENT(OpenCameraPreview, int cam_id;);
+            EVENT(PrepareTrainingFromScene, );
             EVENT(AddPLY, std::filesystem::path path; std::string name;);
             EVENT(RemovePLY, std::string name; bool keep_children = false;);
             EVENT(RenamePLY, std::string old_name; std::string new_name;);
             EVENT(SetPLYVisibility, std::string name; bool visible;);
+            EVENT(RemoveNodeById, int32_t node_id; bool keep_children = false;);
+            EVENT(RenameNodeById, int32_t node_id; std::string new_name;);
+            EVENT(SetNodeVisibilityById, int32_t node_id; bool visible;);
             EVENT(ExportNodeAs, std::string name; ExportFormat format;);
             EVENT(ExportAllMergedAs, ExportFormat format;);
-            EVENT(ReparentNode, std::string node_name; std::string new_parent_name;); // Empty parent = root
-            EVENT(AddGroup, std::string name; std::string parent_name;);              // Create empty group node
-            EVENT(DuplicateNode, std::string name;);                                  // Duplicate node (and children if group)
-            EVENT(MergeGroup, std::string name;);                                     // Merge group children into single PLY
-            EVENT(SetNodeLocked, std::string name; bool locked;);                     // Lock/unlock node for editing
+            EVENT(ReparentNode, std::string node_name; std::string new_parent_name;);    // Empty parent = root
+            EVENT(ReparentNodeById, int32_t node_id; int32_t new_parent_id;);            // -1 parent = root
+            EVENT(MoveNodeById, int32_t node_id; int32_t new_parent_id; int32_t index;); // -1 parent = root, -1 index = append
+            EVENT(AddGroup, std::string name; std::string parent_name;);                 // Create empty group node
+            EVENT(AddGroupByParentId, std::string name; int32_t parent_id;);             // -1 parent = root
+            EVENT(DuplicateNode, std::string name;);                                     // Duplicate node (and children if group)
+            EVENT(DuplicateNodeById, int32_t node_id;);                                  // Duplicate node (and children if group)
+            EVENT(MergeGroup, std::string name;);                                        // Merge group children into single PLY
+            EVENT(MergeGroupById, int32_t node_id;);                                     // Merge group children into single PLY
+            EVENT(SetNodeLocked, std::string name; bool locked;);                        // Lock/unlock node for editing
             EVENT(CropPLY, lfs::geometry::BoundingBox crop_box; bool inverse;);
             EVENT(CropPLYEllipsoid, glm::mat4 world_transform; glm::vec3 radii; bool inverse;);
             EVENT(ApplyCropBox, );
             EVENT(ApplyEllipsoid, );
             EVENT(AddCropBox, std::string node_name;);       // Add cropbox to splat node
             EVENT(AddCropEllipsoid, std::string node_name;); // Add ellipsoid to splat node
-            EVENT(ResetCropBox, );                           // Reset selected cropbox
-            EVENT(ResetEllipsoid, );                         // Reset selected ellipsoid
+            EVENT(AddCropBoxById, int32_t node_id;);
+            EVENT(AddCropEllipsoidById, int32_t node_id;);
+            EVENT(ResetCropBox, );   // Reset selected cropbox
+            EVENT(ResetEllipsoid, ); // Reset selected ellipsoid
             EVENT(FitCropBoxToScene, bool use_percentile;);
             EVENT(FitEllipsoidToScene, bool use_percentile;);
             EVENT(ToggleCropInverse, );
             EVENT(CyclePLY, );
             EVENT(CycleSelectionVisualization, );
             EVENT(ToggleSplitView, );
+            EVENT(ToggleIndependentSplitView, const Viewport* viewport;);
             EVENT(ToggleGTComparison, );
             EVENT(Undo, );
             EVENT(Redo, );
@@ -95,7 +120,28 @@ namespace lfs::core {
             EVENT(DeselectAll, );
             EVENT(SelectAll, );
             EVENT(CopySelection, );
+            EVENT(CutSelection, );
             EVENT(PasteSelection, );
+            EVENT(SelectBrush, float x; float y; float radius; int camera_index; std::string mode;);
+            EVENT(SelectRect, float x0; float y0; float x1; float y1; int camera_index; std::string mode;);
+            EVENT(SelectPolygon, std::vector<glm::vec2> points; int camera_index; std::string mode;);
+            EVENT(SelectLasso, std::vector<glm::vec2> points; int camera_index; std::string mode;);
+            EVENT(SelectRing, float x; float y; int camera_index; std::string mode;);
+            EVENT(SelectByDescription, std::string description; int camera_index;);
+            EVENT(ApplySelectionMask, std::vector<uint8_t> mask;);
+            // Sequencer
+            EVENT(SequencerAddKeyframe, );
+            EVENT(SequencerUpdateKeyframe, ); // Update selected keyframe to current camera
+            EVENT(SequencerPlayPause, );
+            EVENT(SequencerExportVideo, int width; int height; int framerate; int crf;);
+            EVENT(SequencerGoToKeyframe, size_t keyframe_index;);
+            EVENT(SequencerSelectKeyframe, size_t keyframe_index;);
+            EVENT(SequencerDeleteKeyframe, size_t keyframe_index;);
+            EVENT(SequencerSetKeyframeEasing, size_t keyframe_index; int easing_type;);
+            EVENT(SequencerLoadPlySequence, std::string directory; float fps;);
+            EVENT(SaveAsset, std::string node_name;);
+            EVENT(SaveAssetById, int32_t node_id;);
+            EVENT(SaveAssetAs, std::string node_name; std::string asset_name;);
         } // namespace cmd
 
         // ============================================================================
@@ -108,6 +154,9 @@ namespace lfs::core {
             EVENT(AxesSettingsChanged, bool show_axes;);
             EVENT(TranslationGizmoSettingsChanged, bool enabled; float scale;);
             EVENT(SetToolbarTool, int tool_mode;);
+            EVENT(SetSelectionSubMode, int selection_mode;);
+            EVENT(ExecuteMirror, int axis;); // 0=X, 1=Y, 2=Z
+            EVENT(CancelActiveOperator, );   // Cancel and revert current operator
         } // namespace tools
 
         // ============================================================================
@@ -119,23 +168,24 @@ namespace lfs::core {
             EVENT(TrainingProgress, int iteration; float loss; int num_gaussians; bool is_refining = false;);
             EVENT(TrainingPaused, int iteration;);
             EVENT(TrainingResumed, int iteration;);
-            EVENT(TrainingCompleted, int iteration; float final_loss; float elapsed_seconds; bool success; std::optional<std::string> error;);
+            EVENT(TrainingCompleted, int iteration; float final_loss; float elapsed_seconds; bool success; bool user_stopped; std::optional<std::string> error; bool resource_exhausted = false; std::optional<core::WireError> error_info;);
             EVENT(TrainingStopped, int iteration; bool user_requested;);
 
             // Scene state
             EVENT(SceneLoaded,
                   Scene* scene;
                   std::filesystem::path path;
-                  enum class Type{PLY, Dataset, SOG, SPZ, Checkpoint} type;
+                  enum class Type{PLY, Dataset, SOG, SPZ, RAD, Checkpoint} type;
                   size_t num_gaussians;
                   int checkpoint_iteration = 0;);
-            EVENT(SceneCleared, );
+            EVENT(SceneCleared, bool from_history = false;);
             EVENT(ModelUpdated, int iteration; size_t num_gaussians;);
-            EVENT(SceneChanged, );
-            // node_type: 0=SPLAT, 1=GROUP, 2=CROPBOX
-            EVENT(PLYAdded, std::string name; size_t node_gaussians; size_t total_gaussians; bool is_visible; std::string parent_name; bool is_group; int node_type;);
-            EVENT(PLYRemoved, std::string name; bool children_kept = false; std::string parent_of_removed;);
-            EVENT(NodeReparented, std::string name; std::string old_parent; std::string new_parent;);
+            EVENT(SceneChanged, uint32_t mutation_flags = 0;);
+            EVENT(SelectionChanged, bool has_selection; int count;);
+            // node_type stores core::NodeType as int.
+            EVENT(PLYAdded, std::string name; size_t node_gaussians; size_t total_gaussians; bool is_visible; std::string parent_name; bool is_group; int node_type; bool from_history = false;);
+            EVENT(PLYRemoved, std::string name; bool children_kept = false; std::string parent_of_removed; bool from_history = false;);
+            EVENT(NodeReparented, std::string name; std::string old_parent; std::string new_parent; bool from_history = false;);
 
             // Data loading
             EVENT(DatasetLoadStarted, std::filesystem::path path;);
@@ -148,6 +198,7 @@ namespace lfs::core {
                   size_t num_points;);
             EVENT(ConfigLoadFailed, std::filesystem::path path; std::string error;);
             EVENT(FileDropFailed, std::vector<std::string> files; std::string error;);
+            EVENT(SplatFileLoadFailed, std::filesystem::path path; std::string error;);
 
             // Evaluation
             EVENT(EvaluationStarted, int iteration; size_t num_images;);
@@ -161,7 +212,15 @@ namespace lfs::core {
                   int num_gaussians;);
 
             // System state
+            EVENT(EditorScriptStarted, std::filesystem::path path; size_t code_chars;);
+            EVENT(EditorScriptCompleted,
+                  std::filesystem::path path;
+                  size_t code_chars;
+                  size_t output_chars;
+                  bool success;
+                  bool interrupted;);
             EVENT(CheckpointSaved, int iteration; std::filesystem::path path;);
+            EVENT(ExportCompleted, std::filesystem::path path; ExportFormat format;);
             EVENT(DiskSpaceSaveFailed,
                   int iteration;
                   std::filesystem::path path;
@@ -178,9 +237,22 @@ namespace lfs::core {
                   size_t ram_total;
                   float ram_percent;);
             EVENT(FrameRendered, float render_ms; float fps; int num_gaussians;);
+            EVENT(KeyframeListChanged, size_t count;);
+            EVENT(VramPressure,
+                  std::string domain;
+                  size_t requested_bytes;
+                  size_t freed_bytes;
+                  bool recovered;);
+
+            EVENT(ExportFailed, std::string error; bool cancelled = false; std::optional<core::WireError> error_info;);
+            EVENT(VideoExportCompleted, std::filesystem::path path; int total_frames;);
+            EVENT(VideoExportFailed, std::string error;);
+            EVENT(Mesh2SplatCompleted, std::string source_name; std::string node_name; size_t num_gaussians;);
+            EVENT(Mesh2SplatFailed, std::string error;);
 
             // CUDA version check
             EVENT(CudaVersionUnsupported, int major; int minor; int min_major; int min_minor;);
+            EVENT(CudaUnavailable, std::string message;);
         } // namespace state
 
         // ============================================================================
@@ -189,18 +261,20 @@ namespace lfs::core {
         namespace ui {
             EVENT(FileDropReceived, ); // Emitted when files are dropped onto the window
             EVENT(WindowResized, int width; int height;);
+            EVENT(WindowResizeInteraction, bool active;);
             EVENT(CameraMove, glm::mat3 rotation; glm::vec3 translation;);
             EVENT(SpeedChanged, float current_speed; float max_speed;);
             EVENT(ZoomSpeedChanged, float zoom_speed; float max_zoom_speed;);
             EVENT(RenderSettingsChanged,
                   std::optional<int> sh_degree;
-                  std::optional<float> fov;
+                  std::optional<float> focal_length_mm;
                   std::optional<float> scaling_modifier;
                   std::optional<bool> antialiasing;
                   std::optional<glm::vec3> background_color;
                   std::optional<bool> equirectangular;);
             EVENT(RenderModeChanged, std::string old_mode; std::string new_mode;);
             EVENT(PointCloudModeChanged, bool enabled; float voxel_size;);
+            EVENT(AppearanceModelLoaded, bool has_controller;);
             EVENT(GridSettingsChanged,
                   bool enabled;
                   int plane;
@@ -221,10 +295,10 @@ namespace lfs::core {
             EVENT(EllipsoidVisibilityChanged, bool visible;);
             EVENT(ConsoleResult, std::string command; std::string result;);
             EVENT(SplitPositionChanged, float position;);
-            EVENT(GTComparisonModeChanged, bool enabled;);
             EVENT(FocusTrainingPanel, );
             EVENT(ToggleUI, );
             EVENT(ToggleFullscreen, );
+            EVENT(ToggleVramHud, );
         } // namespace ui
 
         // ============================================================================
@@ -234,18 +308,20 @@ namespace lfs::core {
             EVENT(TrainerReady, );
             EVENT(TrainingReadyToStart, );
             EVENT(WindowFocusLost, );
+            EVENT(DisplayScaleChanged, float scale;);
+            EVENT(UiScaleChangeRequested, float scale;); // 0 = auto (from OS)
         } // namespace internal
     } // namespace events
 
     // ============================================================================
     // Convenience functions
     // ============================================================================
-    template <event::Event E>
+    template <::lfs::event::Event E>
     inline void emit(const E& event) {
         event.emit();
     }
 
-    template <event::Event E>
+    template <::lfs::event::Event E>
     inline auto when(auto&& handler) {
         return E::when(std::forward<decltype(handler)>(handler));
     }

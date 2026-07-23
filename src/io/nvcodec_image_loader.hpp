@@ -7,6 +7,7 @@
 #include "core/tensor.hpp"
 #include <filesystem>
 #include <memory>
+#include <utility>
 #include <vector>
 
 // Forward declarations to avoid including nvImageCodec headers in public API
@@ -54,14 +55,16 @@ namespace lfs::io {
          * @param max_width Maximum width/height (0 = no limit)
          * @param cuda_stream Optional CUDA stream for async operations
          * @param format Output format (RGB: [C,H,W], Grayscale: [H,W])
-         * @return Tensor in GPU memory, float32, normalized [0-1]
+         * @param output_uint8 If true for RGB, return uint8 [C,H,W] instead of float32 [0-1]
+         * @return Tensor in GPU memory
          */
         lfs::core::Tensor load_image_gpu(
             const std::filesystem::path& path,
             int resize_factor = 1,
             int max_width = 0,
             void* cuda_stream = nullptr,
-            DecodeFormat format = DecodeFormat::RGB);
+            DecodeFormat format = DecodeFormat::RGB,
+            bool output_uint8 = false);
 
         /**
          * @brief Decode JPEG from memory to GPU
@@ -71,14 +74,16 @@ namespace lfs::io {
          * @param max_width Maximum width/height (0 = no limit)
          * @param cuda_stream Optional CUDA stream for async operations
          * @param format Output format (RGB: [C,H,W], Grayscale: [H,W])
-         * @return Tensor in GPU memory, float32, normalized [0-1]
+         * @param output_uint8 If true for RGB, return uint8 [C,H,W] instead of float32 [0-1]
+         * @return Tensor in GPU memory
          */
         lfs::core::Tensor load_image_from_memory_gpu(
             const std::vector<uint8_t>& jpeg_data,
             int resize_factor = 1,
             int max_width = 0,
             void* cuda_stream = nullptr,
-            DecodeFormat format = DecodeFormat::RGB);
+            DecodeFormat format = DecodeFormat::RGB,
+            bool output_uint8 = false);
 
         // Load and decode multiple images in batch
         std::vector<lfs::core::Tensor> load_images_batch_gpu(
@@ -102,6 +107,48 @@ namespace lfs::io {
             int quality = 100,
             void* cuda_stream = nullptr);
 
+        // Encode GPU tensor to JPEG2k bytes (RGB 16bits)
+        std::vector<uint8_t> encode_to_jpeg2k(
+            const lfs::core::Tensor& image,
+            void* cuda_stream = nullptr,
+            bool high_throughput = true);
+
+        /**
+         * @brief Encode grayscale GPU tensor to lossless 16-bit JPEG2000 bytes
+         *
+         * @param image Float32 CUDA tensor in [H,W] layout, normalized [0,1].
+         * @param cuda_stream Optional CUDA stream for async operations.
+         * @param high_throughput Use JPEG2000 HT block coding.
+         * @return JPEG2000 bytes preserving uint16 sample precision.
+         */
+        std::vector<uint8_t> encode_grayscale_to_jpeg2k(
+            const lfs::core::Tensor& image,
+            void* cuda_stream = nullptr,
+            bool high_throughput = true);
+
+        /**
+         * @brief Decode lossless 16-bit JPEG2000 bytes from memory to GPU float32
+         *
+         * Decodes UINT16 JPEG2000 into a normalized Float32 CUDA tensor without
+         * truncating to 8 bits. Grayscale returns [H,W]; RGB returns interleaved
+         * [H,W,3]. Values round-trip bit-exact for samples representable as
+         * uint16 / 65535.0f.
+         *
+         * @param jpeg2k_data Raw JPEG2000 bytes.
+         * @param cuda_stream Optional CUDA stream for async operations.
+         * @param synchronize Wait for device completion before returning.
+         * @return Float32 CUDA tensor, [H,W] for grayscale or [H,W,3] for RGB.
+         */
+        lfs::core::Tensor decode_jpeg2k_16bit_from_memory_gpu(
+            const std::vector<uint8_t>& jpeg2k_data,
+            void* cuda_stream = nullptr,
+            bool synchronize = true);
+
+        std::vector<lfs::core::Tensor> decode_jpeg2k_16bit_batch_from_spans(
+            const std::vector<std::pair<const uint8_t*, size_t>>& jpeg2k_spans,
+            void* cuda_stream = nullptr,
+            bool synchronize = true);
+
         /**
          * @brief Encode grayscale GPU tensor to JPEG bytes
          *
@@ -113,6 +160,23 @@ namespace lfs::io {
         std::vector<uint8_t> encode_grayscale_to_jpeg(
             const lfs::core::Tensor& image,
             int quality = 100,
+            void* cuda_stream = nullptr);
+
+        /**
+         * @brief Batch encode raw RGB uint8 GPU data to JPEG bytes
+         *
+         * @param gpu_ptrs Vector of GPU device pointers to RGB24 data (HWC, uint8)
+         * @param width Image width (all images must have same dimensions)
+         * @param height Image height
+         * @param quality JPEG quality (1-100)
+         * @param cuda_stream Optional CUDA stream for async operations
+         * @return Vector of JPEG byte vectors
+         */
+        std::vector<std::vector<uint8_t>> encode_batch_rgb_to_jpeg(
+            const std::vector<void*>& gpu_ptrs,
+            int width,
+            int height,
+            int quality = 95,
             void* cuda_stream = nullptr);
 
         /**

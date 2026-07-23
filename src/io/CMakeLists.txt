@@ -24,12 +24,12 @@ target_link_libraries(lfs_io_cuda
         INTERFACE
         lfs_core      # Propagate to consumers, not linked during device linking
         PRIVATE
+        lfs_diagnostics
         CUDA::cudart
 )
 
 set_target_properties(lfs_io_cuda PROPERTIES
         CUDA_SEPARABLE_COMPILATION OFF
-        CUDA_RESOLVE_DEVICE_SYMBOLS ON
         CUDA_STANDARD 20
         CUDA_STANDARD_REQUIRED ON
         POSITION_INDEPENDENT_CODE ON
@@ -38,12 +38,12 @@ set_target_properties(lfs_io_cuda PROPERTIES
 # CUDA compiler options for lfs_io_cuda
 target_compile_options(lfs_io_cuda PRIVATE
         # CUDA device code + MSVC host compiler flags (Windows only)
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g -G -lineinfo --extended-lambda --expt-relaxed-constexpr -Xcompiler=/Od -Xcompiler=/Z7 -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS --diag-suppress=27>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda --expt-relaxed-constexpr --ptxas-options=-v -Xcompiler=/O2 -Xcompiler=/DNDEBUG -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS --diag-suppress=27>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g -lineinfo --extended-lambda --expt-relaxed-constexpr -Xcompiler=/Od -Xcompiler=/Z7 -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS --diag-suppress=27>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda --expt-relaxed-constexpr -Xcompiler=/O2 -Xcompiler=/DNDEBUG -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS --diag-suppress=27>
 
         # CUDA device code for non-Windows
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g -G -lineinfo --extended-lambda --expt-relaxed-constexpr>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda --expt-relaxed-constexpr --ptxas-options=-v>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g -lineinfo --extended-lambda --expt-relaxed-constexpr>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda --expt-relaxed-constexpr>
 )
 
 if(MSVC)
@@ -51,6 +51,41 @@ if(MSVC)
             $<$<COMPILE_LANGUAGE:CUDA>:FMT_UNICODE=0>
     )
 endif()
+
+# RAD encode quantization kernels. Kept out of lfs_io_cuda: bit-parity with
+# the CPU PropertyEncoder requires IEEE arithmetic — no -use_fast_math, no
+# FMA contraction (same constraint as lod_page_dequant_cuda.cu).
+add_library(lfs_io_rad_quant_cuda STATIC
+        cuda/rad_encode_quant.hpp
+        cuda/rad_encode_quant.cu
+)
+
+target_include_directories(lfs_io_rad_quant_cuda
+        PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/src/core/include
+        ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(lfs_io_rad_quant_cuda
+        PRIVATE
+        lfs_diagnostics
+        CUDA::cudart
+)
+
+set_target_properties(lfs_io_rad_quant_cuda PROPERTIES
+        CUDA_SEPARABLE_COMPILATION OFF
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
+        POSITION_INDEPENDENT_CODE ON
+)
+
+target_compile_options(lfs_io_rad_quant_cuda PRIVATE
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g -lineinfo --fmad=false -Xcompiler=/Od -Xcompiler=/Z7 -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:-O3 --fmad=false -Xcompiler=/O2 -Xcompiler=/DNDEBUG -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g -lineinfo --fmad=false>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 --fmad=false>
+)
 
 # SPZ library (Niantic compressed format) - MIT licensed
 add_library(spz_lib STATIC
@@ -61,6 +96,66 @@ add_library(spz_lib STATIC
 target_include_directories(spz_lib PUBLIC ${CMAKE_SOURCE_DIR}/external/spz)
 target_link_libraries(spz_lib PRIVATE ZLIB::ZLIB)
 target_compile_features(spz_lib PUBLIC cxx_std_17)
+set_target_properties(spz_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# Video encoding library (FFmpeg + CUDA for GPU-accelerated encoding)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+        libavcodec
+        libavformat
+        libswscale
+        libavutil
+)
+
+add_library(lfs_video STATIC
+        include/io/video/video_encoder_interface.hpp
+        include/io/video/video_export_options.hpp
+        include/io/video/video_extensions.hpp
+        video/video_encoder.hpp
+        video/video_encoder.cpp
+        video/color_convert.cuh
+        video/color_convert.cu
+        video_frame_extractor.hpp
+        video_frame_extractor.cpp
+        video_player.hpp
+        video_player.cpp
+)
+
+target_include_directories(lfs_video
+        PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+        PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/src/core/include
+        ${CMAKE_SOURCE_DIR}/src
+)
+target_include_directories(lfs_video SYSTEM PRIVATE
+    ${CMAKE_SOURCE_DIR}/external
+)
+
+target_link_libraries(lfs_video
+        PRIVATE
+        PkgConfig::FFMPEG
+        spdlog::spdlog
+        CUDA::cudart
+)
+
+target_compile_features(lfs_video PUBLIC cxx_std_23)
+
+set_target_properties(lfs_video PROPERTIES
+        CUDA_SEPARABLE_COMPILATION OFF
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
+        POSITION_INDEPENDENT_CODE ON
+)
+
+target_compile_options(lfs_video PRIVATE
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g --extended-lambda -Xcompiler=/Od -Xcompiler=/Z7 -Xcompiler=/utf-8>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda -Xcompiler=/O2 -Xcompiler=/utf-8>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g --extended-lambda>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda>
+)
 
 # Main IO library
 add_library(lfs_io STATIC
@@ -86,10 +181,18 @@ add_library(lfs_io STATIC
         formats/html.hpp
         formats/html.cpp
         formats/html_viewer_resources.hpp
+        formats/rad.hpp
+        formats/rad.cpp
+        ply_to_rad_lod.cpp
         formats/spz.hpp
         formats/spz.cpp
+        formats/usd.hpp
+        formats/usd.cpp
+        formats/nurec_usdz.hpp
+        formats/nurec_usdz.cpp
 
         # Concrete loader implementations
+        loaders/loader_utils.hpp
         loaders/ply_loader.hpp
         loaders/ply_loader.cpp
         loaders/colmap_loader.hpp
@@ -100,26 +203,39 @@ add_library(lfs_io STATIC
         loaders/sogs_loader.cpp
         loaders/spz_loader.hpp
         loaders/spz_loader.cpp
+        loaders/usd_loader.hpp
+        loaders/usd_loader.cpp
+        loaders/rad_loader.hpp
+        loaders/rad_loader.cpp
         loaders/checkpoint_loader.hpp
         loaders/checkpoint_loader.cpp
+        loaders/mesh_loader.hpp
+        loaders/mesh_loader.cpp
+        mesh/openmesh_bridge.hpp
+        mesh/openmesh_bridge.cpp
+        mesh/texture_loader.hpp
+        mesh/texture_loader.cpp
         cache_image_loader.cpp
         nvcodec_image_loader.hpp
         nvcodec_image_loader.cpp
         pipelined_image_loader.cpp
         stb_image_impl.cpp
+        tinyply.cpp
+
 )
 
 # Set include directories
-# Public interface is ONLY what's in src/io/include/ - all implementation is private
 target_include_directories(lfs_io
         PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
         PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_SOURCE_DIR}/src
-        ${CMAKE_SOURCE_DIR}/external/nvImageCodec/include
         ${CMAKE_SOURCE_DIR}/external/spz
+)
+target_include_directories(lfs_io SYSTEM PRIVATE
+    ${CMAKE_SOURCE_DIR}/external
+    ${CMAKE_SOURCE_DIR}/external/nvImageCodec/include
 )
 
 # Find the actual WebP library targets
@@ -163,17 +279,23 @@ add_dependencies(lfs_io lfs_io_cuda)
 target_link_libraries(lfs_io
         PUBLIC
         lfs_core            # Link to modular core library for SplatData, Camera, etc.
-        lfs_training        # For checkpoint loading
         PRIVATE
+        lfs_geometry
         TBB::tbb
         spdlog::spdlog
         nlohmann_json::nlohmann_json
         ${WEBP_DECODE_LIB}     # WebP for SOG decompression
         ${WEBP_ENCODE_LIB}     # WebP for SOG/HTML export
         ${ARCHIVE_LIB}         # LibArchive for SOG bundle support
+        ZLIB::ZLIB             # gzip/msgpack payloads inside NuRec USDZ
+        $<IF:$<TARGET_EXISTS:libdeflate::libdeflate_shared>,libdeflate::libdeflate_shared,libdeflate::libdeflate_static> # fast DEFLATE for RAD
         CUDA::cudart           # CUDA runtime for nvImageCodec
         lfs_io_cuda            # IO-specific CUDA kernels (morton, k-means)
+        lfs_io_rad_quant_cuda  # RAD encode quantization (bit-exact, no fast math)
         lfs_core_cuda          # Core CUDA utilities (lanczos_resize for nvcodec)
+        assimp::assimp         # Multi-format mesh import
+        usdVol                 # OpenUSD Gaussian ParticleField import
+        OpenMeshCore
         spz_lib                # Niantic SPZ compressed format
 )
 
@@ -186,8 +308,24 @@ else()
     message(WARNING "nvImageCodec target not found - JPEG hardware decode will not work")
 endif()
 
+if(TARGET nvimgcodec_imgproc_static)
+    target_compile_options(nvimgcodec_imgproc_static PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=860,3004>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_FRONTEND_VARIANT:MSVC>>:-Xcompiler "/wd4834">
+    )
+endif()
+
+if(TARGET nvimgcodec)
+    target_compile_options(nvimgcodec PRIVATE
+        $<$<CXX_COMPILER_FRONTEND_VARIANT:MSVC>:/wd4267>
+    )
+endif()
+
 # Set C++ standard
 target_compile_features(lfs_io PUBLIC cxx_std_23)
+
+# Enable position-independent code for shared library linking (Python module)
+set_target_properties(lfs_io PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Compiler options
 target_compile_options(lfs_io PRIVATE
@@ -208,9 +346,10 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     endif ()
 endif ()
 
-# Export public headers (all interface files in src/io/include/io/)
-install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/io
-        DESTINATION include)
+if(NOT BUILD_PORTABLE)
+    install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/io
+            DESTINATION include)
+endif()
 
 message(STATUS "I/O module configured with SOG support")
 message(STATUS "  IO CUDA library: lfs_io_cuda (morton, k-means)")

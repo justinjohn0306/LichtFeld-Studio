@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include "core/export.hpp"
+#include "cuda_stream_context.hpp"
+
 #include <cstddef> // for size_t
 #include <cstdint>
 #include <memory>    // for std::shared_ptr
@@ -57,25 +60,31 @@ namespace lfs::core {
         const TensorShape& shape() const { return derived().shape_impl(); }
         Device device() const { return derived().device_impl(); }
         DataType dtype() const { return derived().dtype_impl(); }
+        cudaStream_t stream_hint() const { return derived().stream_hint_impl(); }
+
+        Derived snapshot() const { return derived().snapshot_impl(); }
     };
 
     // ============================================================================
     // LEAF EXPRESSION: Wraps an existing Tensor
     // ============================================================================
 
-    class TensorLeaf : public TensorExpr<TensorLeaf> {
+    class LFS_CORE_API TensorLeaf : public TensorExpr<TensorLeaf> {
     private:
         // Use shared_ptr to avoid needing complete Tensor type in header
         std::shared_ptr<Tensor> tensor_ptr_;
 
     public:
-        explicit TensorLeaf(Tensor tensor); // Implemented in .cpp
+        explicit TensorLeaf(Tensor tensor);                  // Implemented in .cpp
+        explicit TensorLeaf(std::shared_ptr<Tensor> tensor); // Implemented in .cpp
 
-        Tensor eval_impl() const; // Implemented in .cpp
+        Tensor eval_impl() const;         // Implemented in .cpp
+        TensorLeaf snapshot_impl() const; // Implemented in .cpp
 
         const TensorShape& shape_impl() const;
         Device device_impl() const;
         DataType dtype_impl() const;
+        cudaStream_t stream_hint_impl() const;
 
         // Enable chaining of operations (template methods must be defined in header)
         // Definition is after UnaryExpr is fully defined (see below line 240)
@@ -114,6 +123,10 @@ namespace lfs::core {
         // Evaluation: implemented in tensor_expr_impl.hpp (needs full Tensor definition)
         Tensor eval_impl() const;
 
+        UnaryExpr snapshot_impl() const {
+            return UnaryExpr(input_.snapshot(), op_, shape_, device_, dtype_);
+        }
+
         // Compose with another unary operation (fusion opportunity!)
         template <typename NewOp>
         auto map(NewOp new_op) const {
@@ -126,6 +139,7 @@ namespace lfs::core {
         const TensorShape& shape_impl() const { return shape_; }
         Device device_impl() const { return device_; }
         DataType dtype_impl() const { return dtype_; }
+        cudaStream_t stream_hint_impl() const { return input_.stream_hint(); }
     };
 
     // ============================================================================
@@ -154,6 +168,10 @@ namespace lfs::core {
         // FUSION DETECTED! Implemented in tensor_expr_impl.hpp
         Tensor eval_impl() const;
 
+        UnaryExpr snapshot_impl() const {
+            return UnaryExpr(inner_expr_.snapshot(), outer_op_, shape_, device_, dtype_);
+        }
+
         // Continue fusion chain
         template <typename NewOp>
         auto map(NewOp new_op) const {
@@ -166,6 +184,7 @@ namespace lfs::core {
         const TensorShape& shape_impl() const { return shape_; }
         Device device_impl() const { return device_; }
         DataType dtype_impl() const { return dtype_; }
+        cudaStream_t stream_hint_impl() const { return inner_expr_.stream_hint(); }
     };
 
     // ============================================================================
@@ -195,6 +214,10 @@ namespace lfs::core {
         // Implemented in tensor_expr_impl.hpp
         Tensor eval_impl() const;
 
+        BinaryExpr snapshot_impl() const {
+            return BinaryExpr(left_.snapshot(), right_.snapshot(), op_, shape_, device_, dtype_);
+        }
+
         // Apply unary operation to result (fuses with binary op)
         template <typename UnaryOp>
         auto map(UnaryOp unary_op) const {
@@ -206,6 +229,15 @@ namespace lfs::core {
         const TensorShape& shape_impl() const { return shape_; }
         Device device_impl() const { return device_; }
         DataType dtype_impl() const { return dtype_; }
+        cudaStream_t stream_hint_impl() const {
+            if (cudaStream_t current = getCurrentCUDAStream()) {
+                return current;
+            }
+            if (cudaStream_t left = left_.stream_hint()) {
+                return left;
+            }
+            return right_.stream_hint();
+        }
     };
 
     // ============================================================================
@@ -233,6 +265,10 @@ namespace lfs::core {
         // Implemented in tensor_expr_impl.hpp
         Tensor eval_impl() const;
 
+        ScalarUnaryExpr snapshot_impl() const {
+            return ScalarUnaryExpr(input_.snapshot(), op_, shape_, device_, dtype_);
+        }
+
         template <typename NewOp>
         auto map(NewOp new_op) const {
             auto fused_op = ops::compose(op_, new_op);
@@ -243,6 +279,7 @@ namespace lfs::core {
         const TensorShape& shape_impl() const { return shape_; }
         Device device_impl() const { return device_; }
         DataType dtype_impl() const { return dtype_; }
+        cudaStream_t stream_hint_impl() const { return input_.stream_hint(); }
     };
 
     // ============================================================================
@@ -274,6 +311,11 @@ namespace lfs::core {
         // Implemented in tensor_expr_impl.hpp
         Tensor eval_impl() const;
 
+        PermutationExpr snapshot_impl() const {
+            return PermutationExpr(
+                input_.snapshot(), indices_.snapshot(), shape_, device_, dtype_);
+        }
+
         // Apply unary operation to gathered result (fuses with gather!)
         template <typename UnaryOp>
         auto map(UnaryOp unary_op) const {
@@ -284,6 +326,15 @@ namespace lfs::core {
         const TensorShape& shape_impl() const { return shape_; }
         Device device_impl() const { return device_; }
         DataType dtype_impl() const { return dtype_; }
+        cudaStream_t stream_hint_impl() const {
+            if (cudaStream_t current = getCurrentCUDAStream()) {
+                return current;
+            }
+            if (cudaStream_t input = input_.stream_hint()) {
+                return input;
+            }
+            return indices_.stream_hint();
+        }
     };
 
     // ============================================================================
@@ -312,9 +363,14 @@ namespace lfs::core {
         // FUSED gather + unary! Implemented in tensor_expr_impl.hpp
         Tensor eval_impl() const;
 
+        UnaryExpr snapshot_impl() const {
+            return UnaryExpr(perm_expr_.snapshot(), op_, shape_, device_, dtype_);
+        }
+
         const TensorShape& shape_impl() const { return shape_; }
         Device device_impl() const { return device_; }
         DataType dtype_impl() const { return dtype_; }
+        cudaStream_t stream_hint_impl() const { return perm_expr_.stream_hint(); }
     };
 
     // ============================================================================

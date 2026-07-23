@@ -16,6 +16,7 @@ endif()
 # All gsplat sources together
 set(GSPLAT_SOURCES
         # C++ files
+        Common.cpp
         Intersect.cpp
         Projection.cpp
         QuatToRotmat.cpp
@@ -36,22 +37,14 @@ set(GSPLAT_SOURCES
 # lfs suffix avoids conflict with legacy gsplat_backend
 add_library(gsplat_backend_lfs STATIC ${GSPLAT_SOURCES})
 
-# PTX-only builds require separable compilation OFF
-if(LFS_DEFER_DEVICE_SYMBOLS)
-    set(_sep_comp OFF)
-else()
-    set(_sep_comp ON)
-endif()
-
 set_target_properties(gsplat_backend_lfs PROPERTIES
         CXX_STANDARD 23
         CXX_STANDARD_REQUIRED ON
         CUDA_STANDARD 20
         CUDA_STANDARD_REQUIRED ON
         CUDA_ARCHITECTURES "${LichtFeld-Studio_CUDA_ARCH}"
-        CUDA_SEPARABLE_COMPILATION ${_sep_comp}
+        CUDA_SEPARABLE_COMPILATION OFF
         POSITION_INDEPENDENT_CODE ON
-        CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
 
 target_include_directories(gsplat_backend_lfs
@@ -60,6 +53,7 @@ target_include_directories(gsplat_backend_lfs
         ${CUDAToolkit_INCLUDE_DIRS}
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/src/core/include
 )
 
 target_link_libraries(gsplat_backend_lfs
@@ -71,11 +65,11 @@ target_link_libraries(gsplat_backend_lfs
 
 target_compile_options(gsplat_backend_lfs PRIVATE
   # CUDA device code + MSVC host compiler flags (Windows only)
-  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g -G -lineinfo --expt-relaxed-constexpr -Xcompiler=/Od -Xcompiler=/Z7>
+  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g -lineinfo --expt-relaxed-constexpr -Xcompiler=/Od -Xcompiler=/Z7>
   $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:-O3 --use_fast_math --expt-relaxed-constexpr --diag-suppress=20012,186,221 -Xcompiler=/O2 -Xcompiler=/DNDEBUG>
 
   # CUDA device code for non-Windows
-  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g -G -lineinfo --expt-relaxed-constexpr>
+  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g -lineinfo --expt-relaxed-constexpr>
   $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 --use_fast_math --expt-relaxed-constexpr --diag-suppress=20012,186,221>
 
   # C++ MSVC
@@ -87,19 +81,13 @@ target_compile_options(gsplat_backend_lfs PRIVATE
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 -DNDEBUG>
 )
 
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    target_compile_definitions(gsplat_backend_lfs PRIVATE DEBUG DEBUG_BUILD)
-elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
-    target_compile_definitions(gsplat_backend_lfs PRIVATE RELEASE_BUILD)
-endif()
-
-# GLM workarounds for CUDA 12.x compatibility
-# GLM_COMPILER=0 disables compiler detection (needed for CUDA 12.x)
-# GLM_FORCE_CUDA enables CUDA support
+# GLM_COMPILER must not be set externally — platform.h redefines it unconditionally (C4005)
 target_compile_definitions(gsplat_backend_lfs PRIVATE
     GLM_FORCE_CUDA
-    GLM_COMPILER=0
 )
+
+target_compile_definitions(gsplat_backend_lfs PUBLIC
+    LFS_CUDA_FAILURE_INJECTION_ENABLED=$<BOOL:${LFS_ENABLE_CUDA_FAILURE_INJECTION}>)
 
 # Print debug info
 message(STATUS "gsplat_backend_lfs configuration:")

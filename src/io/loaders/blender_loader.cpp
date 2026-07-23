@@ -10,12 +10,15 @@
 #include "core/point_cloud.hpp"
 #include "formats/transforms.hpp"
 #include "io/error.hpp"
-#include "training/dataset.hpp"
+#include "io/filesystem_utils.hpp"
+#include "io/loaders/loader_utils.hpp"
 #include <chrono>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <nlohmann/json.hpp>
+#include <optional>
+#include <tuple>
 
 namespace lfs::io {
 
@@ -24,43 +27,6 @@ namespace lfs::io {
     using lfs::core::Device;
     using lfs::core::PointCloud;
     using lfs::core::Tensor;
-
-    namespace {
-        constexpr std::array MASK_FOLDERS = {"masks", "mask", "segmentation"};
-        constexpr std::array MASK_EXTENSIONS = {".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG", ".mask.png"};
-    } // namespace
-
-    // Searches for mask file matching image_name in mask folders.
-    // Priority: exact match, stem+ext (e.g., img.png), full+ext (e.g., img.jpg.png)
-    static std::filesystem::path find_mask_path(const std::filesystem::path& base_path,
-                                                const std::string& image_name) {
-        const std::filesystem::path img_path = lfs::core::utf8_to_path(image_name);
-        const std::filesystem::path stem_path = img_path.parent_path() / img_path.stem();
-
-        for (const auto& folder : MASK_FOLDERS) {
-            const std::filesystem::path mask_dir = base_path / folder;
-            if (!std::filesystem::exists(mask_dir))
-                continue;
-
-            if (const auto exact = mask_dir / img_path; std::filesystem::exists(exact))
-                return exact;
-
-            for (const auto& ext : MASK_EXTENSIONS) {
-                auto path = mask_dir / stem_path;
-                path += ext;
-                if (std::filesystem::exists(path))
-                    return path;
-            }
-
-            for (const auto& ext : MASK_EXTENSIONS) {
-                auto path = mask_dir / img_path;
-                path += ext;
-                if (std::filesystem::exists(path))
-                    return path;
-            }
-        }
-        return {};
-    }
 
     Result<LoadResult> BlenderLoader::load(
         const std::filesystem::path& path,
@@ -73,6 +39,10 @@ namespace lfs::io {
         if (!std::filesystem::exists(path)) {
             return make_error(ErrorCode::PATH_NOT_FOUND,
                               "Blender/NeRF dataset path does not exist", path);
+        }
+
+        if (is_load_cancel_requested(options)) {
+            return make_error(ErrorCode::CANCELLED, "Blender/NeRF dataset load cancelled", path);
         }
 
         // Report initial progress
@@ -137,7 +107,7 @@ namespace lfs::io {
             auto end_time = std::chrono::high_resolution_clock::now();
             return LoadResult{
                 .data = LoadedScene{
-                    .cameras = nullptr,
+                    .cameras = {},
                     .point_cloud = nullptr},
                 .scene_center = Tensor::zeros({3}, Device::CPU, DataType::Float32),
                 .loader_used = name(),
@@ -154,7 +124,8 @@ namespace lfs::io {
             LOG_INFO("Loading Blender/NeRF dataset from: {}", lfs::core::path_to_utf8(transforms_file));
 
             // Read transforms and create cameras
-            auto [camera_infos, scene_center, train_val_split] = read_transforms_cameras_and_images(transforms_file);
+            auto [camera_infos, scene_center, train_val_split] =
+                read_transforms_cameras_and_images(transforms_file, options);
 
             if (options.progress) {
                 options.progress(40.0f, std::format("Creating {} cameras...", camera_infos.size()));
@@ -168,17 +139,63 @@ namespace lfs::io {
 
             // Get base path for mask lookup
             std::filesystem::path base_path = transforms_file.parent_path();
+            MaskDirCache mask_cache(base_path, options.cancel_requested);
+            DepthDirCache depth_cache(base_path, options.cancel_requested);
+            NormalDirCache normal_cache(base_path, options.cancel_requested);
 
             for (size_t i = 0; i < camera_infos.size(); ++i) {
+                if ((i % 64) == 0) {
+                    throw_if_load_cancel_requested(options, "Blender/NeRF camera creation cancelled");
+                }
                 const auto& info = camera_infos[i];
 
                 try {
-                    // Find mask path if available
-                    std::filesystem::path mask_path = find_mask_path(base_path, info._image_name);
+                    std::filesystem::path mask_path;
+                    if (auto mask_lookup = mask_cache.lookup(info._image_name); mask_lookup.found()) {
+                        mask_path = std::move(mask_lookup.path);
+                    } else if (mask_lookup.ambiguous()) {
+                        return make_error(
+                            ErrorCode::INVALID_DATASET,
+                            std::format("Mask for image '{}' is ambiguous across the dataset mask folders. "
+                                        "Keep masks in the same relative subdirectories as the images or rename them uniquely.",
+                                        info._image_name),
+                            base_path);
+                    }
 
-                    // Validate mask dimensions match image dimensions
+                    std::filesystem::path depth_path;
+                    if (auto depth_lookup = depth_cache.lookup(info._image_name); depth_lookup.found()) {
+                        depth_path = std::move(depth_lookup.path);
+                    } else if (depth_lookup.ambiguous()) {
+                        return make_error(
+                            ErrorCode::INVALID_DATASET,
+                            std::format("Depth map for image '{}' is ambiguous across the dataset depth folders. "
+                                        "Keep depth maps in the same relative subdirectories as the images or rename them uniquely.",
+                                        info._image_name),
+                            base_path);
+                    }
+
+                    std::filesystem::path normal_path;
+                    if (auto normal_lookup = normal_cache.lookup(info._image_name); normal_lookup.found()) {
+                        normal_path = std::move(normal_lookup.path);
+                    } else if (normal_lookup.ambiguous()) {
+                        return make_error(
+                            ErrorCode::INVALID_DATASET,
+                            std::format("Normal map for image '{}' is ambiguous across the dataset normal folders. "
+                                        "Keep normal maps in the same relative subdirectories as the images or rename them uniquely.",
+                                        info._image_name),
+                            base_path);
+                    }
+
+                    // Validate mask/depth dimensions match image dimensions
+                    std::optional<std::tuple<int, int, int>> image_info;
+                    auto get_image_info_cached = [&]() {
+                        if (!image_info.has_value()) {
+                            image_info = lfs::core::get_image_info(info._image_path);
+                        }
+                        return *image_info;
+                    };
                     if (!mask_path.empty()) {
-                        auto [img_w, img_h, img_c] = lfs::core::get_image_info(info._image_path);
+                        auto [img_w, img_h, img_c] = get_image_info_cached();
                         auto [mask_w, mask_h, mask_c] = lfs::core::get_image_info(mask_path);
                         if (img_w != mask_w || img_h != mask_h) {
                             return make_error(ErrorCode::MASK_SIZE_MISMATCH,
@@ -186,6 +203,28 @@ namespace lfs::io {
                                                           lfs::core::path_to_utf8(mask_path.filename()), mask_w, mask_h,
                                                           info._image_name, img_w, img_h),
                                               mask_path);
+                        }
+                    }
+                    if (!depth_path.empty()) {
+                        auto [img_w, img_h, img_c] = get_image_info_cached();
+                        auto [depth_w, depth_h, depth_c] = lfs::core::get_image_info(depth_path);
+                        if (img_w != depth_w || img_h != depth_h) {
+                            return make_error(ErrorCode::DEPTH_SIZE_MISMATCH,
+                                              std::format("Depth map '{}' is {}x{} but image '{}' is {}x{}",
+                                                          lfs::core::path_to_utf8(depth_path.filename()), depth_w, depth_h,
+                                                          info._image_name, img_w, img_h),
+                                              depth_path);
+                        }
+                    }
+                    if (!normal_path.empty()) {
+                        auto [img_w, img_h, img_c] = get_image_info_cached();
+                        auto [normal_w, normal_h, normal_c] = lfs::core::get_image_info(normal_path);
+                        if (img_w != normal_w || img_h != normal_h) {
+                            return make_error(ErrorCode::NORMAL_SIZE_MISMATCH,
+                                              std::format("Normal map '{}' is {}x{} but image '{}' is {}x{}",
+                                                          lfs::core::path_to_utf8(normal_path.filename()), normal_w, normal_h,
+                                                          info._image_name, img_w, img_h),
+                                              normal_path);
                         }
                     }
 
@@ -204,7 +243,10 @@ namespace lfs::io {
                         mask_path,
                         info._width,
                         info._height,
-                        static_cast<int>(i));
+                        static_cast<int>(i),
+                        0,
+                        depth_path,
+                        normal_path);
 
                     cameras.push_back(cam);
                 } catch (const std::exception& e) {
@@ -213,19 +255,13 @@ namespace lfs::io {
                 }
             }
 
-            // Create dataset configuration
-            lfs::training::DatasetConfig dataset_config;
-            dataset_config.resize_factor = options.resize_factor;
-            dataset_config.max_width = options.max_width;
-            dataset_config.test_every = 8; // Default split behavior
-
-            // Create dataset with ALL images
-            auto dataset = std::make_shared<lfs::training::CameraDataset>(
-                std::move(cameras), dataset_config, lfs::training::CameraDataset::Split::ALL);
+            const bool images_have_alpha = detect_camera_alpha(cameras, options.cancel_requested);
 
             if (options.progress) {
                 options.progress(60.0f, "Loading point cloud...");
             }
+
+            throw_if_load_cancel_requested(options, "Blender/NeRF point cloud load cancelled");
 
             // Check ply_file_path in transforms.json (nerfstudio format), fallback to pointcloud.ply
             std::filesystem::path pointcloud_path;
@@ -246,7 +282,9 @@ namespace lfs::io {
             std::shared_ptr<PointCloud> point_cloud;
             std::vector<std::string> warnings;
             if (std::filesystem::exists(pointcloud_path)) {
-                point_cloud = std::make_shared<PointCloud>(load_simple_ply_point_cloud(pointcloud_path));
+                auto loaded_point_cloud = load_simple_ply_point_cloud(pointcloud_path, options);
+                point_cloud = std::make_shared<PointCloud>(
+                    convert_transforms_point_cloud_to_colmap_world(std::move(loaded_point_cloud)));
                 LOG_INFO("Loaded {} points from {}", point_cloud->size(),
                          lfs::core::path_to_utf8(pointcloud_path.filename()));
             } else {
@@ -254,6 +292,9 @@ namespace lfs::io {
                 LOG_WARN("No PLY found, using {} random points", point_cloud->size());
                 warnings.emplace_back("No point cloud file found, using random initialization");
             }
+
+            // Centralize scene
+            scene_center = centralize_scene(cameras, point_cloud, options.centralize, scene_center);
 
             if (options.progress) {
                 options.progress(100.0f, "Blender/NeRF loading complete");
@@ -263,18 +304,17 @@ namespace lfs::io {
             auto load_time = std::chrono::duration_cast<std::chrono::milliseconds>(
                 end_time - start_time);
 
-            // Get scene center values for logging
             auto scene_center_cpu = scene_center.cpu();
             const float* sc_ptr = scene_center_cpu.template ptr<float>();
 
-            // Save dataset size before moving
-            size_t num_cameras = dataset->size();
+            size_t num_cameras = cameras.size();
 
             LoadResult result{
                 .data = LoadedScene{
-                    .cameras = std::move(dataset),
+                    .cameras = std::move(cameras),
                     .point_cloud = std::move(point_cloud)},
                 .scene_center = scene_center,
+                .images_have_alpha = images_have_alpha,
                 .loader_used = name(),
                 .load_time = load_time,
                 .warnings = std::move(warnings)};
@@ -286,6 +326,8 @@ namespace lfs::io {
 
             return result;
 
+        } catch (const LoadCancelledError& e) {
+            return make_error(ErrorCode::CANCELLED, e.what(), path);
         } catch (const std::exception& e) {
             return make_error(ErrorCode::CORRUPTED_DATA,
                               std::format("Failed to load Blender/NeRF dataset: {}", e.what()), path);

@@ -4,20 +4,21 @@
 
 #pragma once
 
+#include "core/export.hpp"
 #include "core/splat_data.hpp"
+#include "io/exporter.hpp"
 #include <expected>
 #include <filesystem>
-#include <functional>
 #include <string>
 
 namespace lfs::vis::gui {
 
     struct HtmlViewerExportOptions {
         std::filesystem::path output_path;
-        std::function<void(float, const std::string&)> progress_callback;
+        lfs::io::ExportProgressCallback progress_callback;
     };
 
-    std::expected<void, std::string> export_html_viewer(
+    LFS_VIS_API std::expected<void, std::string> export_html_viewer(
         const lfs::core::SplatData& splat_data,
         const HtmlViewerExportOptions& options);
 

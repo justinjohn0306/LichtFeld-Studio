@@ -1,8 +1,11 @@
 /* SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "core/cuda_error.hpp"
+#include "internal/tensor_dtype_dispatch.hpp"
 #include "internal/tensor_impl.hpp"
 #include "internal/tensor_ops.hpp"
+#include <algorithm>
 #include <cuda_runtime.h>
 
 namespace lfs::core {
@@ -19,18 +22,17 @@ namespace lfs::core {
             const size_t* __restrict__ strides,
             const size_t rank,
             const size_t n) {
-            const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-            if (idx >= n)
-                return;
-
-            size_t tmp = idx;
-            size_t offset = 0;
-            for (int d = rank - 1; d >= 0; --d) {
-                const size_t coord = tmp % shape[d];
-                tmp /= shape[d];
-                offset += coord * strides[d];
+            const size_t stride = blockDim.x * static_cast<size_t>(gridDim.x);
+            for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n; idx += stride) {
+                size_t tmp = idx;
+                size_t offset = 0;
+                for (int d = rank - 1; d >= 0; --d) {
+                    const size_t coord = tmp % shape[d];
+                    tmp /= shape[d];
+                    offset += coord * strides[d];
+                }
+                output[offset] = input[idx];
             }
-            output[offset] = input[idx];
         }
 
         // Rank-2 optimized (column slices)
@@ -41,13 +43,12 @@ namespace lfs::core {
             const size_t d0, const size_t d1,
             const size_t s0, const size_t s1,
             const size_t n) {
-            const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-            if (idx >= n)
-                return;
-
-            const size_t i1 = idx % d1;
-            const size_t i0 = idx / d1;
-            output[i0 * s0 + i1 * s1] = input[idx];
+            const size_t stride = blockDim.x * static_cast<size_t>(gridDim.x);
+            for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n; idx += stride) {
+                const size_t i1 = idx % d1;
+                const size_t i0 = idx / d1;
+                output[i0 * s0 + i1 * s1] = input[idx];
+            }
         }
 
         template <typename T>
@@ -56,14 +57,14 @@ namespace lfs::core {
             const size_t d0, const size_t d1, const size_t d2,
             const size_t s0, const size_t s1, const size_t s2,
             const size_t n) {
-            const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-            if (idx >= n)
-                return;
-            const size_t i2 = idx % d2;
-            const size_t tmp = idx / d2;
-            const size_t i1 = tmp % d1;
-            const size_t i0 = tmp / d1;
-            output[i0 * s0 + i1 * s1 + i2 * s2] = input[idx];
+            const size_t stride = blockDim.x * static_cast<size_t>(gridDim.x);
+            for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n; idx += stride) {
+                const size_t i2 = idx % d2;
+                const size_t tmp = idx / d2;
+                const size_t i1 = tmp % d1;
+                const size_t i0 = tmp / d1;
+                output[i0 * s0 + i1 * s1 + i2 * s2] = input[idx];
+            }
         }
 
         template <typename T>
@@ -72,16 +73,16 @@ namespace lfs::core {
             const size_t d0, const size_t d1, const size_t d2, const size_t d3,
             const size_t s0, const size_t s1, const size_t s2, const size_t s3,
             const size_t n) {
-            const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-            if (idx >= n)
-                return;
-            const size_t i3 = idx % d3;
-            size_t tmp = idx / d3;
-            const size_t i2 = tmp % d2;
-            tmp /= d2;
-            const size_t i1 = tmp % d1;
-            const size_t i0 = tmp / d1;
-            output[i0 * s0 + i1 * s1 + i2 * s2 + i3 * s3] = input[idx];
+            const size_t stride = blockDim.x * static_cast<size_t>(gridDim.x);
+            for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n; idx += stride) {
+                const size_t i3 = idx % d3;
+                size_t tmp = idx / d3;
+                const size_t i2 = tmp % d2;
+                tmp /= d2;
+                const size_t i1 = tmp % d1;
+                const size_t i0 = tmp / d1;
+                output[i0 * s0 + i1 * s1 + i2 * s2 + i3 * s3] = input[idx];
+            }
         }
 
         // Fused int32→float32 rank-2
@@ -91,14 +92,15 @@ namespace lfs::core {
             const size_t d0, const size_t d1,
             const size_t s0, const size_t s1,
             const size_t n) {
-            const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-            if (idx >= n)
-                return;
-
-            const size_t i1 = idx % d1;
-            const size_t i0 = idx / d1;
-            output[i0 * s0 + i1 * s1] = static_cast<float>(input[idx]);
+            const size_t stride = blockDim.x * static_cast<size_t>(gridDim.x);
+            for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n; idx += stride) {
+                const size_t i1 = idx % d1;
+                const size_t i0 = idx / d1;
+                output[i0 * s0 + i1 * s1] = static_cast<float>(input[idx]);
+            }
         }
+
+        constexpr int MAX_GRID = 65535;
 
         void launch_strided_scatter_int32_to_float32(
             const void* input, void* output,
@@ -106,10 +108,13 @@ namespace lfs::core {
             const size_t rank, const size_t n, cudaStream_t stream) {
             if (rank != 2)
                 return;
-            const int blocks = (n + SCATTER_BLOCK_SIZE - 1) / SCATTER_BLOCK_SIZE;
+            const int blocks = static_cast<int>(std::min(
+                (n + SCATTER_BLOCK_SIZE - 1) / SCATTER_BLOCK_SIZE,
+                static_cast<size_t>(MAX_GRID)));
             strided_scatter_int32_to_float32_rank2<<<blocks, SCATTER_BLOCK_SIZE, 0, stream>>>(
                 static_cast<const int32_t*>(input), static_cast<float*>(output),
                 shape[0], shape[1], strides[0], strides[1], n);
+            LFS_CUDA_CHECK(cudaGetLastError());
         }
 
         void launch_strided_scatter(
@@ -117,87 +122,68 @@ namespace lfs::core {
             const size_t* shape, const size_t* strides,
             const size_t rank, const size_t n,
             const DataType dtype, cudaStream_t stream) {
-            const int blocks = (n + SCATTER_BLOCK_SIZE - 1) / SCATTER_BLOCK_SIZE;
+            if (n == 0)
+                return;
+            LFS_ASSERT_MSG(input != nullptr && output != nullptr,
+                           "strided scatter requires valid input and output pointers");
+            LFS_ASSERT_MSG(shape != nullptr && strides != nullptr && rank > 0,
+                           "strided scatter requires non-empty shape metadata");
+            const int blocks = static_cast<int>(std::min(
+                (n + SCATTER_BLOCK_SIZE - 1) / SCATTER_BLOCK_SIZE,
+                static_cast<size_t>(MAX_GRID)));
 
-#define LAUNCH_RANK2(T)                                                      \
-    strided_scatter_kernel_rank2<<<blocks, SCATTER_BLOCK_SIZE, 0, stream>>>( \
-        static_cast<const T*>(input), static_cast<T*>(output),               \
-        shape[0], shape[1], strides[0], strides[1], n)
-
-#define LAUNCH_GENERIC(T)                                              \
-    strided_scatter_kernel<<<blocks, SCATTER_BLOCK_SIZE, 0, stream>>>( \
-        static_cast<const T*>(input), static_cast<T*>(output),         \
-        shape, strides, rank, n)
-
-            if (rank == 2) {
-                switch (dtype) {
-                case DataType::Float32: LAUNCH_RANK2(float); break;
-                case DataType::Int32: LAUNCH_RANK2(int32_t); break;
-                case DataType::Int64: LAUNCH_RANK2(int64_t); break;
-                case DataType::UInt8: LAUNCH_RANK2(uint8_t); break;
-                case DataType::Bool: LAUNCH_RANK2(bool); break;
-                default: break;
+            detail::dispatch_dtype(dtype, [&]<typename T>() {
+                if (rank == 2) {
+                    strided_scatter_kernel_rank2<<<blocks, SCATTER_BLOCK_SIZE, 0, stream>>>(
+                        static_cast<const T*>(input), static_cast<T*>(output),
+                        shape[0], shape[1], strides[0], strides[1], n);
+                    LFS_CUDA_LAUNCH_CHECK(stream, "tensor.strided.scatter_rank2");
+                } else {
+                    strided_scatter_kernel<<<blocks, SCATTER_BLOCK_SIZE, 0, stream>>>(
+                        static_cast<const T*>(input), static_cast<T*>(output),
+                        shape, strides, rank, n);
                 }
-            } else {
-                switch (dtype) {
-                case DataType::Float32: LAUNCH_GENERIC(float); break;
-                case DataType::Int32: LAUNCH_GENERIC(int32_t); break;
-                case DataType::Int64: LAUNCH_GENERIC(int64_t); break;
-                case DataType::UInt8: LAUNCH_GENERIC(uint8_t); break;
-                case DataType::Bool: LAUNCH_GENERIC(bool); break;
-                default: break;
-                }
-            }
-
-#undef LAUNCH_RANK2
-#undef LAUNCH_GENERIC
+            });
+            LFS_CUDA_CHECK(cudaGetLastError());
         }
 
         void launch_strided_scatter_immediate(
             const void* input, void* output,
             const std::vector<size_t>& shape, const std::vector<size_t>& strides,
             const size_t n, const DataType dtype, cudaStream_t stream) {
-            const int blocks = (n + SCATTER_BLOCK_SIZE - 1) / SCATTER_BLOCK_SIZE;
+            if (n == 0)
+                return;
+            LFS_ASSERT_MSG(input != nullptr && output != nullptr,
+                           "strided scatter requires valid input and output pointers");
+            LFS_ASSERT_MSG(shape.size() == strides.size(),
+                           "strided scatter shape and stride ranks must match");
+            const int blocks = static_cast<int>(std::min(
+                (n + SCATTER_BLOCK_SIZE - 1) / SCATTER_BLOCK_SIZE,
+                static_cast<size_t>(MAX_GRID)));
             const size_t rank = shape.size();
+            LFS_ASSERT_MSG(rank >= 2 && rank <= 4,
+                           "immediate strided scatter supports only ranks 2 through 4");
 
-#define LAUNCH_SCATTER2(T) strided_scatter_kernel_rank2<<<blocks, SCATTER_BLOCK_SIZE, 0, stream>>>( \
-    static_cast<const T*>(input), static_cast<T*>(output), shape[0], shape[1], strides[0], strides[1], n)
-#define LAUNCH_SCATTER3(T) strided_scatter_kernel_rank3<<<blocks, SCATTER_BLOCK_SIZE, 0, stream>>>( \
-    static_cast<const T*>(input), static_cast<T*>(output), shape[0], shape[1], shape[2], strides[0], strides[1], strides[2], n)
-#define LAUNCH_SCATTER4(T) strided_scatter_kernel_rank4<<<blocks, SCATTER_BLOCK_SIZE, 0, stream>>>( \
-    static_cast<const T*>(input), static_cast<T*>(output), shape[0], shape[1], shape[2], shape[3], strides[0], strides[1], strides[2], strides[3], n)
-
-            if (rank == 2) {
-                switch (dtype) {
-                case DataType::Float32: LAUNCH_SCATTER2(float); break;
-                case DataType::Int32: LAUNCH_SCATTER2(int32_t); break;
-                case DataType::Int64: LAUNCH_SCATTER2(int64_t); break;
-                case DataType::UInt8: LAUNCH_SCATTER2(uint8_t); break;
-                case DataType::Bool: LAUNCH_SCATTER2(bool); break;
-                default: break;
+            detail::dispatch_dtype(dtype, [&]<typename T>() {
+                if (rank == 2) {
+                    strided_scatter_kernel_rank2<<<blocks, SCATTER_BLOCK_SIZE, 0, stream>>>(
+                        static_cast<const T*>(input), static_cast<T*>(output),
+                        shape[0], shape[1], strides[0], strides[1], n);
+                    LFS_CUDA_LAUNCH_CHECK(stream, "tensor.strided.scatter_rank2");
+                } else if (rank == 3) {
+                    strided_scatter_kernel_rank3<<<blocks, SCATTER_BLOCK_SIZE, 0, stream>>>(
+                        static_cast<const T*>(input), static_cast<T*>(output),
+                        shape[0], shape[1], shape[2],
+                        strides[0], strides[1], strides[2], n);
+                    LFS_CUDA_LAUNCH_CHECK(stream, "tensor.strided.scatter_rank3");
+                } else {
+                    strided_scatter_kernel_rank4<<<blocks, SCATTER_BLOCK_SIZE, 0, stream>>>(
+                        static_cast<const T*>(input), static_cast<T*>(output),
+                        shape[0], shape[1], shape[2], shape[3],
+                        strides[0], strides[1], strides[2], strides[3], n);
                 }
-            } else if (rank == 3) {
-                switch (dtype) {
-                case DataType::Float32: LAUNCH_SCATTER3(float); break;
-                case DataType::Int32: LAUNCH_SCATTER3(int32_t); break;
-                case DataType::Int64: LAUNCH_SCATTER3(int64_t); break;
-                case DataType::UInt8: LAUNCH_SCATTER3(uint8_t); break;
-                case DataType::Bool: LAUNCH_SCATTER3(bool); break;
-                default: break;
-                }
-            } else if (rank == 4) {
-                switch (dtype) {
-                case DataType::Float32: LAUNCH_SCATTER4(float); break;
-                case DataType::Int32: LAUNCH_SCATTER4(int32_t); break;
-                case DataType::Int64: LAUNCH_SCATTER4(int64_t); break;
-                case DataType::UInt8: LAUNCH_SCATTER4(uint8_t); break;
-                case DataType::Bool: LAUNCH_SCATTER4(bool); break;
-                default: break;
-                }
-            }
-#undef LAUNCH_SCATTER2
-#undef LAUNCH_SCATTER3
-#undef LAUNCH_SCATTER4
+            });
+            LFS_CUDA_CHECK(cudaGetLastError());
         }
 
         // Strided copy kernels (read strided → write contiguous)
@@ -206,12 +192,12 @@ namespace lfs::core {
             const T* __restrict__ input, T* __restrict__ output,
             const size_t d0, const size_t d1, const size_t s0, const size_t s1,
             const size_t n) {
-            const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-            if (idx >= n)
-                return;
-            const size_t i1 = idx % d1;
-            const size_t i0 = idx / d1;
-            output[idx] = input[i0 * s0 + i1 * s1];
+            const size_t stride = blockDim.x * static_cast<size_t>(gridDim.x);
+            for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n; idx += stride) {
+                const size_t i1 = idx % d1;
+                const size_t i0 = idx / d1;
+                output[idx] = input[i0 * s0 + i1 * s1];
+            }
         }
 
         template <typename T>
@@ -220,14 +206,14 @@ namespace lfs::core {
             const size_t d0, const size_t d1, const size_t d2,
             const size_t s0, const size_t s1, const size_t s2,
             const size_t n) {
-            const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-            if (idx >= n)
-                return;
-            const size_t i2 = idx % d2;
-            const size_t tmp = idx / d2;
-            const size_t i1 = tmp % d1;
-            const size_t i0 = tmp / d1;
-            output[idx] = input[i0 * s0 + i1 * s1 + i2 * s2];
+            const size_t stride = blockDim.x * static_cast<size_t>(gridDim.x);
+            for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n; idx += stride) {
+                const size_t i2 = idx % d2;
+                const size_t tmp = idx / d2;
+                const size_t i1 = tmp % d1;
+                const size_t i0 = tmp / d1;
+                output[idx] = input[i0 * s0 + i1 * s1 + i2 * s2];
+            }
         }
 
         template <typename T>
@@ -236,16 +222,16 @@ namespace lfs::core {
             const size_t d0, const size_t d1, const size_t d2, const size_t d3,
             const size_t s0, const size_t s1, const size_t s2, const size_t s3,
             const size_t n) {
-            const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-            if (idx >= n)
-                return;
-            const size_t i3 = idx % d3;
-            size_t tmp = idx / d3;
-            const size_t i2 = tmp % d2;
-            tmp /= d2;
-            const size_t i1 = tmp % d1;
-            const size_t i0 = tmp / d1;
-            output[idx] = input[i0 * s0 + i1 * s1 + i2 * s2 + i3 * s3];
+            const size_t stride = blockDim.x * static_cast<size_t>(gridDim.x);
+            for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n; idx += stride) {
+                const size_t i3 = idx % d3;
+                size_t tmp = idx / d3;
+                const size_t i2 = tmp % d2;
+                tmp /= d2;
+                const size_t i1 = tmp % d1;
+                const size_t i0 = tmp / d1;
+                output[idx] = input[i0 * s0 + i1 * s1 + i2 * s2 + i3 * s3];
+            }
         }
 
         template <typename T>
@@ -253,65 +239,56 @@ namespace lfs::core {
             const T* __restrict__ input, T* __restrict__ output,
             const size_t* __restrict__ shape, const size_t* __restrict__ strides,
             const size_t rank, const size_t n) {
-            const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-            if (idx >= n)
-                return;
-
-            size_t tmp = idx;
-            size_t input_offset = 0;
-            for (int d = rank - 1; d >= 0; --d) {
-                const size_t coord = tmp % shape[d];
-                tmp /= shape[d];
-                input_offset += coord * strides[d];
+            const size_t stride = blockDim.x * static_cast<size_t>(gridDim.x);
+            for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n; idx += stride) {
+                size_t tmp = idx;
+                size_t input_offset = 0;
+                for (int d = rank - 1; d >= 0; --d) {
+                    const size_t coord = tmp % shape[d];
+                    tmp /= shape[d];
+                    input_offset += coord * strides[d];
+                }
+                output[idx] = input[input_offset];
             }
-            output[idx] = input[input_offset];
         }
 
         void launch_strided_copy_immediate(
             const void* input, void* output,
             const std::vector<size_t>& shape, const std::vector<size_t>& strides,
             const size_t n, const DataType dtype, cudaStream_t stream) {
-            const int num_blocks = (n + SCATTER_BLOCK_SIZE - 1) / SCATTER_BLOCK_SIZE;
+            if (n == 0)
+                return;
+            LFS_ASSERT_MSG(input != nullptr && output != nullptr,
+                           "strided copy requires valid input and output pointers");
+            LFS_ASSERT_MSG(shape.size() == strides.size(),
+                           "strided copy shape and stride ranks must match");
+            const int num_blocks = static_cast<int>(std::min(
+                (n + SCATTER_BLOCK_SIZE - 1) / SCATTER_BLOCK_SIZE,
+                static_cast<size_t>(MAX_GRID)));
             const size_t rank = shape.size();
+            LFS_ASSERT_MSG(rank >= 2 && rank <= 4,
+                           "immediate strided copy supports only ranks 2 through 4");
 
-#define LAUNCH_COPY2(T) strided_copy_kernel_rank2<<<num_blocks, SCATTER_BLOCK_SIZE, 0, stream>>>( \
-    static_cast<const T*>(input), static_cast<T*>(output), shape[0], shape[1], strides[0], strides[1], n)
-#define LAUNCH_COPY3(T) strided_copy_kernel_rank3<<<num_blocks, SCATTER_BLOCK_SIZE, 0, stream>>>( \
-    static_cast<const T*>(input), static_cast<T*>(output), shape[0], shape[1], shape[2], strides[0], strides[1], strides[2], n)
-#define LAUNCH_COPY4(T) strided_copy_kernel_rank4<<<num_blocks, SCATTER_BLOCK_SIZE, 0, stream>>>( \
-    static_cast<const T*>(input), static_cast<T*>(output), shape[0], shape[1], shape[2], shape[3], strides[0], strides[1], strides[2], strides[3], n)
-
-            if (rank == 2) {
-                switch (dtype) {
-                case DataType::Float32: LAUNCH_COPY2(float); break;
-                case DataType::Int32: LAUNCH_COPY2(int32_t); break;
-                case DataType::Int64: LAUNCH_COPY2(int64_t); break;
-                case DataType::UInt8: LAUNCH_COPY2(uint8_t); break;
-                case DataType::Bool: LAUNCH_COPY2(bool); break;
-                default: break;
+            detail::dispatch_dtype(dtype, [&]<typename T>() {
+                if (rank == 2) {
+                    strided_copy_kernel_rank2<<<num_blocks, SCATTER_BLOCK_SIZE, 0, stream>>>(
+                        static_cast<const T*>(input), static_cast<T*>(output),
+                        shape[0], shape[1], strides[0], strides[1], n);
+                    LFS_CUDA_LAUNCH_CHECK(stream, "tensor.strided.copy_rank2");
+                } else if (rank == 3) {
+                    strided_copy_kernel_rank3<<<num_blocks, SCATTER_BLOCK_SIZE, 0, stream>>>(
+                        static_cast<const T*>(input), static_cast<T*>(output),
+                        shape[0], shape[1], shape[2],
+                        strides[0], strides[1], strides[2], n);
+                    LFS_CUDA_LAUNCH_CHECK(stream, "tensor.strided.copy_rank3");
+                } else {
+                    strided_copy_kernel_rank4<<<num_blocks, SCATTER_BLOCK_SIZE, 0, stream>>>(
+                        static_cast<const T*>(input), static_cast<T*>(output),
+                        shape[0], shape[1], shape[2], shape[3],
+                        strides[0], strides[1], strides[2], strides[3], n);
                 }
-            } else if (rank == 3) {
-                switch (dtype) {
-                case DataType::Float32: LAUNCH_COPY3(float); break;
-                case DataType::Int32: LAUNCH_COPY3(int32_t); break;
-                case DataType::Int64: LAUNCH_COPY3(int64_t); break;
-                case DataType::UInt8: LAUNCH_COPY3(uint8_t); break;
-                case DataType::Bool: LAUNCH_COPY3(bool); break;
-                default: break;
-                }
-            } else if (rank == 4) {
-                switch (dtype) {
-                case DataType::Float32: LAUNCH_COPY4(float); break;
-                case DataType::Int32: LAUNCH_COPY4(int32_t); break;
-                case DataType::Int64: LAUNCH_COPY4(int64_t); break;
-                case DataType::UInt8: LAUNCH_COPY4(uint8_t); break;
-                case DataType::Bool: LAUNCH_COPY4(bool); break;
-                default: break;
-                }
-            }
-#undef LAUNCH_COPY2
-#undef LAUNCH_COPY3
-#undef LAUNCH_COPY4
+            });
+            LFS_CUDA_CHECK(cudaGetLastError());
         }
 
         void launch_strided_copy(
@@ -323,44 +300,23 @@ namespace lfs::core {
             size_t total_elements,
             DataType dtype,
             cudaStream_t stream) {
+            if (total_elements == 0)
+                return;
+            LFS_ASSERT_MSG(input != nullptr && output != nullptr,
+                           "strided copy requires valid input and output pointers");
+            LFS_ASSERT_MSG(shape != nullptr && strides != nullptr && rank > 0,
+                           "strided copy requires non-empty shape metadata");
             const int block_size = 256;
-            const int num_blocks = (total_elements + block_size - 1) / block_size;
+            const int num_blocks = static_cast<int>(std::min(
+                (total_elements + block_size - 1) / block_size,
+                static_cast<size_t>(MAX_GRID)));
 
-            switch (dtype) {
-            case DataType::Float32:
+            detail::dispatch_dtype(dtype, [&]<typename T>() {
                 strided_copy_kernel<<<num_blocks, block_size, 0, stream>>>(
-                    static_cast<const float*>(input),
-                    static_cast<float*>(output),
+                    static_cast<const T*>(input), static_cast<T*>(output),
                     shape, strides, rank, total_elements);
-                break;
-            case DataType::Int32:
-                strided_copy_kernel<<<num_blocks, block_size, 0, stream>>>(
-                    static_cast<const int32_t*>(input),
-                    static_cast<int32_t*>(output),
-                    shape, strides, rank, total_elements);
-                break;
-            case DataType::Int64:
-                strided_copy_kernel<<<num_blocks, block_size, 0, stream>>>(
-                    static_cast<const int64_t*>(input),
-                    static_cast<int64_t*>(output),
-                    shape, strides, rank, total_elements);
-                break;
-            case DataType::UInt8:
-                strided_copy_kernel<<<num_blocks, block_size, 0, stream>>>(
-                    static_cast<const uint8_t*>(input),
-                    static_cast<uint8_t*>(output),
-                    shape, strides, rank, total_elements);
-                break;
-            case DataType::Bool:
-                strided_copy_kernel<<<num_blocks, block_size, 0, stream>>>(
-                    static_cast<const bool*>(input),
-                    static_cast<bool*>(output),
-                    shape, strides, rank, total_elements);
-                break;
-            default:
-                // Unsupported dtype - do nothing
-                break;
-            }
+            });
+            LFS_CUDA_CHECK(cudaGetLastError());
         }
 
         // ============= Fused Strided Upload Kernel =============
@@ -378,21 +334,16 @@ namespace lfs::core {
             size_t d0, size_t d1, size_t d2,  // Shape (immediate parameters)
             size_t s0, size_t s1, size_t s2,  // Strides (immediate parameters)
             size_t total_elements) {
-            size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-            if (idx >= total_elements)
-                return;
+            const size_t stride = blockDim.x * static_cast<size_t>(gridDim.x);
+            for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total_elements; idx += stride) {
+                size_t i2 = idx % d2;
+                size_t tmp = idx / d2;
+                size_t i1 = tmp % d1;
+                size_t i0 = tmp / d1;
 
-            // Convert flat output index to multi-dimensional coordinates
-            // Iteration order: i2 → i1 → i0
-            size_t i2 = idx % d2;
-            size_t tmp = idx / d2;
-            size_t i1 = tmp % d1;
-            size_t i0 = tmp / d1;
-
-            size_t input_offset = i0 * s0 + i1 * s1 + i2 * s2;
-
-            // Read from pinned host memory and write to GPU memory
-            gpu_output[idx] = host_input[input_offset];
+                size_t input_offset = i0 * s0 + i1 * s1 + i2 * s2;
+                gpu_output[idx] = host_input[input_offset];
+            }
         }
 
         // ============= SPECIALIZED HWC→CHW KERNEL =============
@@ -407,27 +358,17 @@ namespace lfs::core {
             const T* __restrict__ host_input,
             T* __restrict__ gpu_output,
             size_t H, size_t W, size_t C) {
+            const size_t total = H * W * C;
+            const size_t stride = blockDim.x * static_cast<size_t>(gridDim.x);
+            for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += stride) {
+                size_t c = idx % C;
+                size_t tmp = idx / C;
+                size_t w = tmp % W;
+                size_t h = tmp / W;
 
-            size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-            size_t total = H * W * C;
-            if (idx >= total)
-                return;
-
-            // Decompose linear index in HWC order (INPUT layout)
-            // idx = h*W*C + w*C + c
-            size_t c = idx % C;
-            size_t tmp = idx / C;
-            size_t w = tmp % W;
-            size_t h = tmp / W;
-
-            // Input offset (already in HWC order, contiguous)
-            size_t input_offset = idx;
-
-            // Output offset in CHW order: [C, H, W]
-            size_t output_offset = c * (H * W) + h * W + w;
-
-            // Consecutive threads read consecutive host memory (FAST PCIe!)
-            gpu_output[output_offset] = host_input[input_offset];
+                size_t output_offset = c * (H * W) + h * W + w;
+                gpu_output[output_offset] = host_input[idx];
+            }
         }
 
         // ============= ADAPTIVE GATHER KERNELS (Different iteration orders) =============
@@ -441,23 +382,17 @@ namespace lfs::core {
             size_t d0, size_t d1, size_t d2,
             size_t s0, size_t s1, size_t s2,
             size_t total_elements) {
-            size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-            if (idx >= total_elements)
-                return;
+            const size_t stride = blockDim.x * static_cast<size_t>(gridDim.x);
+            for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total_elements; idx += stride) {
+                size_t i1 = idx % d1;
+                size_t tmp = idx / d1;
+                size_t i2 = tmp % d2;
+                size_t i0 = tmp / d2;
 
-            // Iteration order: i1 → i2 → i0
-            size_t i1 = idx % d1;
-            size_t tmp = idx / d1;
-            size_t i2 = tmp % d2;
-            size_t i0 = tmp / d2;
-
-            // Input offset with strides
-            size_t input_offset = i0 * s0 + i1 * s1 + i2 * s2;
-
-            // Output offset in standard row-major order [d0, d1, d2]
-            size_t output_offset = i0 * (d1 * d2) + i1 * d2 + i2;
-
-            gpu_output[output_offset] = host_input[input_offset];
+                size_t input_offset = i0 * s0 + i1 * s1 + i2 * s2;
+                size_t output_offset = i0 * (d1 * d2) + i1 * d2 + i2;
+                gpu_output[output_offset] = host_input[input_offset];
+            }
         }
 
         // Iteration order: i0 → i1 → i2 (good when s0 is smallest)
@@ -468,23 +403,17 @@ namespace lfs::core {
             size_t d0, size_t d1, size_t d2,
             size_t s0, size_t s1, size_t s2,
             size_t total_elements) {
-            size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-            if (idx >= total_elements)
-                return;
+            const size_t stride = blockDim.x * static_cast<size_t>(gridDim.x);
+            for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total_elements; idx += stride) {
+                size_t i0 = idx % d0;
+                size_t tmp = idx / d0;
+                size_t i1 = tmp % d1;
+                size_t i2 = tmp / d1;
 
-            // Iteration order: i0 → i1 → i2
-            size_t i0 = idx % d0;
-            size_t tmp = idx / d0;
-            size_t i1 = tmp % d1;
-            size_t i2 = tmp / d1;
-
-            // Input offset with strides
-            size_t input_offset = i0 * s0 + i1 * s1 + i2 * s2;
-
-            // Output offset in standard row-major order [d0, d1, d2]
-            size_t output_offset = i0 * (d1 * d2) + i1 * d2 + i2;
-
-            gpu_output[output_offset] = host_input[input_offset];
+                size_t input_offset = i0 * s0 + i1 * s1 + i2 * s2;
+                size_t output_offset = i0 * (d1 * d2) + i1 * d2 + i2;
+                gpu_output[output_offset] = host_input[input_offset];
+            }
         }
 
         // Generic fallback for arbitrary rank
@@ -496,23 +425,17 @@ namespace lfs::core {
             const size_t* __restrict__ strides,
             size_t rank,
             size_t total_elements) {
-            size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-            if (idx >= total_elements)
-                return;
-
-            // Convert flat output index to multi-dimensional coordinates
-            size_t tmp = idx;
-            size_t input_offset = 0;
-
-            // Generic path for arbitrary rank
-            for (int d = rank - 1; d >= 0; --d) {
-                size_t coord = tmp % shape[d];
-                tmp /= shape[d];
-                input_offset += coord * strides[d];
+            const size_t stride = blockDim.x * static_cast<size_t>(gridDim.x);
+            for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total_elements; idx += stride) {
+                size_t tmp = idx;
+                size_t input_offset = 0;
+                for (int d = rank - 1; d >= 0; --d) {
+                    size_t coord = tmp % shape[d];
+                    tmp /= shape[d];
+                    input_offset += coord * strides[d];
+                }
+                gpu_output[idx] = host_input[input_offset];
             }
-
-            // Read from pinned host memory and write to GPU memory
-            gpu_output[idx] = host_input[input_offset];
         }
 
         void launch_strided_upload(
@@ -525,9 +448,17 @@ namespace lfs::core {
             DataType dtype,
             cudaStream_t stream) {
 
-            // Use larger blocks for better occupancy during PCIe reads
+            if (total_elements == 0)
+                return;
+            LFS_ASSERT_MSG(host_input != nullptr && gpu_output != nullptr,
+                           "strided upload requires valid input and output pointers");
+            LFS_ASSERT_MSG(d_shape != nullptr && d_strides != nullptr && rank > 0,
+                           "strided upload requires non-empty shape metadata");
+
             const int block_size = 256;
-            const int num_blocks = (total_elements + block_size - 1) / block_size;
+            const int num_blocks = static_cast<int>(std::min(
+                (total_elements + block_size - 1) / block_size,
+                static_cast<size_t>(MAX_GRID)));
 
             // FAST PATH: Rank-3 with adaptive kernel selection based on stride pattern
             if (rank == 3) {
@@ -553,23 +484,13 @@ namespace lfs::core {
                     size_t H = d_shape[1];
                     size_t W = d_shape[2];
 
-                    switch (dtype) {
-                    case DataType::Float32:
+                    detail::dispatch_dtype(dtype, [&]<typename T>() {
                         strided_upload_kernel_hwc_to_chw<<<num_blocks, block_size, 0, stream>>>(
-                            static_cast<const float*>(host_input),
-                            static_cast<float*>(gpu_output),
+                            static_cast<const T*>(host_input),
+                            static_cast<T*>(gpu_output),
                             H, W, C);
-                        break;
-                    case DataType::UInt8:
-                        strided_upload_kernel_hwc_to_chw<<<num_blocks, block_size, 0, stream>>>(
-                            static_cast<const uint8_t*>(host_input),
-                            static_cast<uint8_t*>(gpu_output),
-                            H, W, C);
-                        break;
-                    default:
-                        // Fall through to generic path
-                        break;
-                    }
+                        LFS_CUDA_LAUNCH_CHECK(stream, "tensor.strided.upload_hwc_to_chw");
+                    });
                     return;
                 }
 
@@ -617,171 +538,44 @@ namespace lfs::core {
                     order = IterOrder::ORDER_012;
                 }
 
-                // Dispatch to appropriate kernel based on dtype and iteration order
-                switch (dtype) {
-                case DataType::Float32:
+                detail::dispatch_dtype(dtype, [&]<typename T>() {
                     if (order == IterOrder::ORDER_210) {
                         strided_upload_kernel_rank3_gather<<<num_blocks, block_size, 0, stream>>>(
-                            static_cast<const float*>(host_input),
-                            static_cast<float*>(gpu_output),
+                            static_cast<const T*>(host_input),
+                            static_cast<T*>(gpu_output),
                             d_shape[0], d_shape[1], d_shape[2],
                             d_strides[0], d_strides[1], d_strides[2],
                             total_elements);
+                        LFS_CUDA_LAUNCH_CHECK(stream, "tensor.strided.upload_rank3_gather");
                     } else if (order == IterOrder::ORDER_120) {
                         strided_upload_kernel_rank3_gather_order_120<<<num_blocks, block_size, 0, stream>>>(
-                            static_cast<const float*>(host_input),
-                            static_cast<float*>(gpu_output),
+                            static_cast<const T*>(host_input),
+                            static_cast<T*>(gpu_output),
                             d_shape[0], d_shape[1], d_shape[2],
                             d_strides[0], d_strides[1], d_strides[2],
                             total_elements);
+                        LFS_CUDA_LAUNCH_CHECK(stream, "tensor.strided.upload_rank3_gather_120");
                     } else {
                         strided_upload_kernel_rank3_gather_order_012<<<num_blocks, block_size, 0, stream>>>(
-                            static_cast<const float*>(host_input),
-                            static_cast<float*>(gpu_output),
+                            static_cast<const T*>(host_input),
+                            static_cast<T*>(gpu_output),
                             d_shape[0], d_shape[1], d_shape[2],
                             d_strides[0], d_strides[1], d_strides[2],
                             total_elements);
+                        LFS_CUDA_LAUNCH_CHECK(stream, "tensor.strided.upload_rank3_gather_012");
                     }
-                    break;
-                case DataType::Int32:
-                    if (order == IterOrder::ORDER_210) {
-                        strided_upload_kernel_rank3_gather<<<num_blocks, block_size, 0, stream>>>(
-                            static_cast<const int32_t*>(host_input),
-                            static_cast<int32_t*>(gpu_output),
-                            d_shape[0], d_shape[1], d_shape[2],
-                            d_strides[0], d_strides[1], d_strides[2],
-                            total_elements);
-                    } else if (order == IterOrder::ORDER_120) {
-                        strided_upload_kernel_rank3_gather_order_120<<<num_blocks, block_size, 0, stream>>>(
-                            static_cast<const int32_t*>(host_input),
-                            static_cast<int32_t*>(gpu_output),
-                            d_shape[0], d_shape[1], d_shape[2],
-                            d_strides[0], d_strides[1], d_strides[2],
-                            total_elements);
-                    } else {
-                        strided_upload_kernel_rank3_gather_order_012<<<num_blocks, block_size, 0, stream>>>(
-                            static_cast<const int32_t*>(host_input),
-                            static_cast<int32_t*>(gpu_output),
-                            d_shape[0], d_shape[1], d_shape[2],
-                            d_strides[0], d_strides[1], d_strides[2],
-                            total_elements);
-                    }
-                    break;
-                case DataType::Int64:
-                    if (order == IterOrder::ORDER_210) {
-                        strided_upload_kernel_rank3_gather<<<num_blocks, block_size, 0, stream>>>(
-                            static_cast<const int64_t*>(host_input),
-                            static_cast<int64_t*>(gpu_output),
-                            d_shape[0], d_shape[1], d_shape[2],
-                            d_strides[0], d_strides[1], d_strides[2],
-                            total_elements);
-                    } else if (order == IterOrder::ORDER_120) {
-                        strided_upload_kernel_rank3_gather_order_120<<<num_blocks, block_size, 0, stream>>>(
-                            static_cast<const int64_t*>(host_input),
-                            static_cast<int64_t*>(gpu_output),
-                            d_shape[0], d_shape[1], d_shape[2],
-                            d_strides[0], d_strides[1], d_strides[2],
-                            total_elements);
-                    } else {
-                        strided_upload_kernel_rank3_gather_order_012<<<num_blocks, block_size, 0, stream>>>(
-                            static_cast<const int64_t*>(host_input),
-                            static_cast<int64_t*>(gpu_output),
-                            d_shape[0], d_shape[1], d_shape[2],
-                            d_strides[0], d_strides[1], d_strides[2],
-                            total_elements);
-                    }
-                    break;
-                case DataType::UInt8:
-                    if (order == IterOrder::ORDER_210) {
-                        strided_upload_kernel_rank3_gather<<<num_blocks, block_size, 0, stream>>>(
-                            static_cast<const uint8_t*>(host_input),
-                            static_cast<uint8_t*>(gpu_output),
-                            d_shape[0], d_shape[1], d_shape[2],
-                            d_strides[0], d_strides[1], d_strides[2],
-                            total_elements);
-                    } else if (order == IterOrder::ORDER_120) {
-                        strided_upload_kernel_rank3_gather_order_120<<<num_blocks, block_size, 0, stream>>>(
-                            static_cast<const uint8_t*>(host_input),
-                            static_cast<uint8_t*>(gpu_output),
-                            d_shape[0], d_shape[1], d_shape[2],
-                            d_strides[0], d_strides[1], d_strides[2],
-                            total_elements);
-                    } else {
-                        strided_upload_kernel_rank3_gather_order_012<<<num_blocks, block_size, 0, stream>>>(
-                            static_cast<const uint8_t*>(host_input),
-                            static_cast<uint8_t*>(gpu_output),
-                            d_shape[0], d_shape[1], d_shape[2],
-                            d_strides[0], d_strides[1], d_strides[2],
-                            total_elements);
-                    }
-                    break;
-                case DataType::Bool:
-                    if (order == IterOrder::ORDER_210) {
-                        strided_upload_kernel_rank3_gather<<<num_blocks, block_size, 0, stream>>>(
-                            static_cast<const bool*>(host_input),
-                            static_cast<bool*>(gpu_output),
-                            d_shape[0], d_shape[1], d_shape[2],
-                            d_strides[0], d_strides[1], d_strides[2],
-                            total_elements);
-                    } else if (order == IterOrder::ORDER_120) {
-                        strided_upload_kernel_rank3_gather_order_120<<<num_blocks, block_size, 0, stream>>>(
-                            static_cast<const bool*>(host_input),
-                            static_cast<bool*>(gpu_output),
-                            d_shape[0], d_shape[1], d_shape[2],
-                            d_strides[0], d_strides[1], d_strides[2],
-                            total_elements);
-                    } else {
-                        strided_upload_kernel_rank3_gather_order_012<<<num_blocks, block_size, 0, stream>>>(
-                            static_cast<const bool*>(host_input),
-                            static_cast<bool*>(gpu_output),
-                            d_shape[0], d_shape[1], d_shape[2],
-                            d_strides[0], d_strides[1], d_strides[2],
-                            total_elements);
-                    }
-                    break;
-                default:
-                    // Unsupported dtype - do nothing
-                    break;
-                }
+                });
                 return;
             }
 
             // GENERIC PATH: Uses device memory for shape/strides (requires caller to allocate)
-            switch (dtype) {
-            case DataType::Float32:
+            detail::dispatch_dtype(dtype, [&]<typename T>() {
                 strided_upload_kernel<<<num_blocks, block_size, 0, stream>>>(
-                    static_cast<const float*>(host_input),
-                    static_cast<float*>(gpu_output),
+                    static_cast<const T*>(host_input),
+                    static_cast<T*>(gpu_output),
                     d_shape, d_strides, rank, total_elements);
-                break;
-            case DataType::Int32:
-                strided_upload_kernel<<<num_blocks, block_size, 0, stream>>>(
-                    static_cast<const int32_t*>(host_input),
-                    static_cast<int32_t*>(gpu_output),
-                    d_shape, d_strides, rank, total_elements);
-                break;
-            case DataType::Int64:
-                strided_upload_kernel<<<num_blocks, block_size, 0, stream>>>(
-                    static_cast<const int64_t*>(host_input),
-                    static_cast<int64_t*>(gpu_output),
-                    d_shape, d_strides, rank, total_elements);
-                break;
-            case DataType::UInt8:
-                strided_upload_kernel<<<num_blocks, block_size, 0, stream>>>(
-                    static_cast<const uint8_t*>(host_input),
-                    static_cast<uint8_t*>(gpu_output),
-                    d_shape, d_strides, rank, total_elements);
-                break;
-            case DataType::Bool:
-                strided_upload_kernel<<<num_blocks, block_size, 0, stream>>>(
-                    static_cast<const bool*>(host_input),
-                    static_cast<bool*>(gpu_output),
-                    d_shape, d_strides, rank, total_elements);
-                break;
-            default:
-                // Unsupported dtype - do nothing
-                break;
-            }
+                LFS_CUDA_LAUNCH_CHECK(stream, "tensor.strided.upload_generic");
+            });
         }
 
     } // namespace tensor_ops

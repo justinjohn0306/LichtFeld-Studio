@@ -5,23 +5,35 @@
 #pragma once
 
 #include "core/events.hpp"
+#include "core/export.hpp"
 #include "core/parameters.hpp"
+#include "core/scene.hpp"
 #include "core/services.hpp"
 #include "core/splat_data_mirror.hpp"
 #include "geometry/bounding_box.hpp"
 #include "io/loader.hpp"
-#include "scene/scene.hpp"
 #include "scene/scene_render_state.hpp"
+#include "scene/selection_state.hpp"
+#include "selection/selection_service.hpp"
+#include "training/components/ppisp.hpp"
+#include "training/components/ppisp_controller_pool.hpp"
+#include <expected>
 #include <filesystem>
+#include <glm/vec2.hpp>
 #include <mutex>
-#include <set>
+#include <optional>
+#include <thread>
 
 namespace lfs::vis {
+
+    namespace op {
+        class SceneSnapshot;
+    }
 
     // Forward declarations
     class Trainer;
 
-    class SceneManager {
+    class LFS_VIS_API SceneManager {
     public:
         // Content type - what's loaded, not execution state
         enum class ContentType {
@@ -44,7 +56,7 @@ namespace lfs::vis {
         }
         bool isEmpty() const {
             std::lock_guard<std::mutex> lock(state_mutex_);
-            return content_type_ == ContentType::Empty;
+            return content_type_ == ContentType::Empty && !scene_.hasNodes();
         }
 
         bool hasSplatFiles() const {
@@ -81,43 +93,59 @@ namespace lfs::vis {
             std::lock_guard<std::mutex> lock(state_mutex_);
             return dataset_path_;
         }
+        [[nodiscard]] std::optional<std::filesystem::path> getPlyPath(const std::string& name) const;
+        void setPlyPath(const std::string& name, const std::filesystem::path& path);
+        void clearPlyPath(const std::string& name);
+        void movePlyPath(const std::string& old_name, const std::string& new_name);
+        void setDatasetPath(const std::filesystem::path& path);
 
         // Scene access
-        Scene& getScene() { return scene_; }
-        const Scene& getScene() const { return scene_; }
+        core::Scene& getScene() { return scene_; }
+        const core::Scene& getScene() const { return scene_; }
 
         // Service accessors (via service locator)
         TrainerManager* getTrainerManager() { return services().trainerOrNull(); }
         const TrainerManager* getTrainerManager() const { return services().trainerOrNull(); }
         RenderingManager* getRenderingManager() { return services().renderingOrNull(); }
-        command::CommandHistory* getCommandHistory() { return services().commandsOrNull(); }
 
         void changeContentType(const ContentType& type);
 
         // Operations - Generic splat file loading
         void loadSplatFile(const std::filesystem::path& path);
         std::string addSplatFile(const std::filesystem::path& path, const std::string& name = "", bool is_visible = true);
+        std::string addGeneratedSplatNode(std::unique_ptr<core::SplatData> model,
+                                          const std::string& source_name,
+                                          const std::string& desired_name,
+                                          bool select_new_node = true);
         size_t consolidateNodeModels();
 
         void removePLY(const std::string& name, bool keep_children = false);
         void setPLYVisibility(const std::string& name, bool visible);
+        void removeNode(core::NodeId id, bool keep_children = false);
+        void setNodeVisibility(core::NodeId id, bool visible);
 
         // Node selection
         void selectNode(const std::string& name);
+        void selectNode(core::NodeId id);
         void selectNodes(const std::vector<std::string>& names);
+        void selectNodesById(const std::vector<core::NodeId>& ids);
         void addToSelection(const std::string& name);
+        void addToSelection(core::NodeId id);
+        void removeFromSelection(const std::string& name);
+        void removeFromSelection(core::NodeId id);
         void clearSelection();
         [[nodiscard]] std::string getSelectedNodeName() const;
         [[nodiscard]] std::vector<std::string> getSelectedNodeNames() const;
         [[nodiscard]] bool hasSelectedNode() const;
-        [[nodiscard]] NodeType getSelectedNodeType() const;
+        [[nodiscard]] core::NodeType getSelectedNodeType() const;
         [[nodiscard]] int getSelectedNodeIndex() const;
         [[nodiscard]] std::vector<bool> getSelectedNodeMask() const;
-        void ensureCropBoxForSelectedNode();
-        void selectCropBoxForCurrentNode();
+        [[nodiscard]] int getSelectedCameraUid() const;
+        [[nodiscard]] const SelectionState& selectionState() const { return selection_; }
+        void invalidateNodeSelectionMask();
 
         // Node picking
-        [[nodiscard]] std::string pickNodeAtWorldPosition(const glm::vec3& world_pos) const;
+        [[nodiscard]] std::string pickNodeByRay(const glm::vec3& ray_origin, const glm::vec3& ray_dir) const;
         [[nodiscard]] std::vector<std::string> pickNodesInScreenRect(
             const glm::vec2& rect_min, const glm::vec2& rect_max,
             const glm::mat4& view, const glm::mat4& proj,
@@ -133,29 +161,36 @@ namespace lfs::vis {
 
         // Full transform for selected node (includes rotation and scale)
         void setSelectedNodeTransform(const glm::mat4& transform);
-        glm::mat4 getSelectedNodeTransform() const;      // Returns local transform
-        glm::mat4 getSelectedNodeWorldTransform() const; // Returns world transform
+        glm::mat4 getSelectedNodeTransform() const; // Returns local transform
+        [[nodiscard]] glm::mat4 getSelectedNodeVisualizerWorldTransform() const;
 
         // Multi-selection support
         [[nodiscard]] glm::vec3 getSelectionCenter() const;
-        [[nodiscard]] glm::vec3 getSelectionWorldCenter() const;
+        [[nodiscard]] glm::vec3 getSelectionWorldCenter() const; // Deprecated legacy data-world center for compatibility
+        [[nodiscard]] glm::vec3 getSelectionVisualizerWorldCenter() const;
 
         // Cropbox operations for selected node
-        NodeId getSelectedNodeCropBoxId() const;
-        CropBoxData* getSelectedNodeCropBox();
-        const CropBoxData* getSelectedNodeCropBox() const;
+        core::NodeId getSelectedNodeCropBoxId() const;
+        core::CropBoxData* getSelectedNodeCropBox();
+        const core::CropBoxData* getSelectedNodeCropBox() const;
+        core::NodeId getActiveSelectionCropBoxId() const;
         void syncCropBoxToRenderSettings();
 
         // Ellipsoid operations for selected node
-        void ensureEllipsoidForSelectedNode();
-        void selectEllipsoidForCurrentNode();
-        NodeId getSelectedNodeEllipsoidId() const;
-        EllipsoidData* getSelectedNodeEllipsoid();
-        const EllipsoidData* getSelectedNodeEllipsoid() const;
+        core::NodeId getSelectedNodeEllipsoidId() const;
+        core::EllipsoidData* getSelectedNodeEllipsoid();
+        const core::EllipsoidData* getSelectedNodeEllipsoid() const;
+        core::NodeId getActiveSelectionEllipsoidId() const;
         void syncEllipsoidToRenderSettings();
 
-        void loadDataset(const std::filesystem::path& path,
-                         const lfs::core::param::TrainingParameters& params);
+        std::expected<void, std::string> loadDataset(const std::filesystem::path& path,
+                                                     const lfs::core::param::TrainingParameters& params);
+
+        // Import COLMAP cameras only (no images required)
+        // Loads cameras from sparse folder and displays frustums without needing image files
+        void loadColmapCamerasOnly(const std::filesystem::path& sparse_path);
+
+        void prepareTrainingFromScene();
 
         // Apply pre-loaded dataset to scene (for async loading)
         // The LoadResult comes from background thread, scene modification happens on main thread
@@ -166,7 +201,7 @@ namespace lfs::vis {
 
         void loadCheckpointForTraining(const std::filesystem::path& path,
                                        const lfs::core::param::TrainingParameters& params);
-        void clear();
+        [[nodiscard]] bool clear();
         void switchToEditMode(); // Keep trained model, discard dataset
 
         // For rendering - gets appropriate model
@@ -188,7 +223,23 @@ namespace lfs::vis {
         SceneInfo getSceneInfo() const;
 
         bool renamePLY(const std::string& old_name, const std::string& new_name);
+        bool renameNode(core::NodeId id, const std::string& new_name);
         void updatePlyPath(const std::string& ply_name, const std::filesystem::path& ply_path);
+        bool reparentNode(const std::string& node_name, const std::string& new_parent_name);
+        bool reparentNode(core::NodeId node_id, core::NodeId new_parent_id);
+        bool moveNode(core::NodeId node_id, core::NodeId new_parent_id, int index);
+        std::string addGroupNode(const std::string& name, const std::string& parent_name = "");
+        std::string addGroupNode(const std::string& name, core::NodeId parent_id);
+        std::string addPlySequenceNode(const std::string& name, const std::string& parent_name = "", size_t frame_count = 0);
+
+        // Allocator that backs splat tensors with Vulkan-external interop storage (the
+        // form the rasterizer can bind zero-copy). Returns an empty allocator when interop
+        // is unavailable. The PLY-sequence streaming player uses this on the main thread to
+        // upload background-decoded frames into render-ready storage.
+        [[nodiscard]] lfs::io::SplatTensorAllocator makeExternalSplatAllocator() const;
+
+        std::string duplicateNodeTree(const std::string& name);
+        std::string mergeGroupNode(const std::string& name);
 
         // Permanently remove soft-deleted gaussians from all nodes
         size_t applyDeleted();
@@ -196,35 +247,122 @@ namespace lfs::vis {
         // Clipboard - node-level copy/paste
         bool copySelectedNodes();
         std::vector<std::string> pasteNodes();
-        [[nodiscard]] bool hasClipboard() const { return !clipboard_.empty(); }
+        [[nodiscard]] bool hasClipboard() const;
 
         // Gaussian-level copy/paste (for selection tools)
         bool copySelectedGaussians();
+        bool cutSelectedGaussians();
         std::vector<std::string> pasteGaussians();
-        [[nodiscard]] bool hasGaussianClipboard() const { return gaussian_clipboard_ != nullptr; }
+        [[nodiscard]] bool hasGaussianClipboard() const;
 
         /// Mirror selected gaussians along specified axis
         bool executeMirror(lfs::core::MirrorAxis axis);
 
+        [[nodiscard]] std::expected<void, std::string> softDeleteSelectedGaussians();
+        [[nodiscard]] std::expected<void, std::string> deleteSelectedGaussiansWithHistory();
+        void deleteSelectedGaussians();
+        void invertSelection();
+        void deselectAllGaussians();
+        void selectAllGaussians();
+        void copySelectionToClipboard();
+        void pasteSelectionFromClipboard();
+        [[nodiscard]] SelectionResult selectBrush(float x, float y, float radius, const std::string& mode,
+                                                  int camera_index = 0);
+        [[nodiscard]] SelectionResult selectRect(float x0, float y0, float x1, float y1, const std::string& mode,
+                                                 int camera_index = 0);
+        [[nodiscard]] SelectionResult selectPolygon(const std::vector<glm::vec2>& points, const std::string& mode,
+                                                    int camera_index = 0);
+        [[nodiscard]] SelectionResult selectLasso(const std::vector<glm::vec2>& points, const std::string& mode,
+                                                  int camera_index = 0);
+        [[nodiscard]] SelectionResult selectRing(float x, float y, const std::string& mode, int camera_index = 0);
+        [[nodiscard]] SelectionResult applySelectionMask(const std::vector<uint8_t>& mask);
+        [[nodiscard]] SelectionResult applySelectionMask(const lfs::core::Tensor& mask);
+        [[nodiscard]] SelectionResult previewSelectionMask(const lfs::core::Tensor& mask);
+        void commitSelectionPreview();
+        void cancelSelectionPreview();
+
+        void initSelectionService();
+        [[nodiscard]] SelectionService* getSelectionService() { return selection_service_.get(); }
+
+        void setAppearanceModel(std::unique_ptr<lfs::training::PPISP> ppisp,
+                                std::unique_ptr<lfs::training::PPISPControllerPool> controller_pool = nullptr);
+        void clearAppearanceModel();
+        [[nodiscard]] lfs::training::PPISP* getAppearancePPISP() { return appearance_ppisp_.get(); }
+        [[nodiscard]] const lfs::training::PPISP* getAppearancePPISP() const { return appearance_ppisp_.get(); }
+        [[nodiscard]] lfs::training::PPISPControllerPool* getAppearanceControllerPool() { return appearance_controller_pool_.get(); }
+        [[nodiscard]] const lfs::training::PPISPControllerPool* getAppearanceControllerPool() const { return appearance_controller_pool_.get(); }
+        [[nodiscard]] bool hasAppearanceController() const { return appearance_controller_pool_ != nullptr; }
+        [[nodiscard]] bool hasAppearanceModel() const { return appearance_ppisp_ != nullptr; }
+
     private:
+        enum class HistoryMode : uint8_t {
+            Record,
+            Skip,
+        };
+
+        struct GaussianDeletionSlice {
+            std::string node_name;
+            size_t begin = 0;
+            size_t end = 0;
+        };
+
+        struct GaussianDeletionPlan {
+            lfs::core::Tensor selection_mask;
+            bool consolidated = false;
+            bool any_visible_node = false;
+            std::vector<GaussianDeletionSlice> partial_slices;
+            std::vector<std::string> removed_node_names;
+        };
+
+        [[nodiscard]] bool resetToEmptyState(bool trainer_already_cleared = false);
+        enum class TrainingRemovalImpact {
+            None,
+            TrainingModel,
+            ActiveTrainingCamera,
+        };
+
+        [[nodiscard]] TrainingRemovalImpact classifyTrainingRemovalImpact(const std::string& name) const;
+        [[nodiscard]] std::expected<void, std::string> validateNodeRemoval(const std::string& name,
+                                                                           TrainingRemovalImpact impact) const;
+        [[nodiscard]] std::expected<void, std::string> removeNodeImpl(const std::string& name,
+                                                                      bool keep_children,
+                                                                      HistoryMode history_mode);
+        [[nodiscard]] std::expected<void, std::string> removeNodeImpl(const std::string& name,
+                                                                      bool keep_children,
+                                                                      HistoryMode history_mode,
+                                                                      TrainingRemovalImpact impact);
+        // Drop the GUI's borrowed scene-image tensor and drain the GPU so no in-flight
+        // Vulkan work references model tensors that are about to be freed. Must run
+        // before releasing splat models, especially when their tensors are backed by
+        // Vulkan-external storage (freeing imported memory under the GPU faults the
+        // device with VK_ERROR_DEVICE_LOST).
+        void drainGpuForTensorRelease();
         void setupEventHandlers();
-        void emitSceneChanged();
-        void syncCropToolRenderSettings(const SceneNode* node);
+        void finalizeDatasetSceneLoad(const std::filesystem::path& dataset_path,
+                                      const std::filesystem::path& scene_path,
+                                      lfs::core::events::state::SceneLoaded::Type type,
+                                      size_t num_gaussians,
+                                      int checkpoint_iteration = 0);
+        void syncDatasetCameraFrustumsToRenderSettings();
+        void syncCropToolRenderSettings(const core::SceneNode* node);
+        void loadPPISPCompanion(const std::filesystem::path& ppisp_path);
         void handleCropActivePly(const lfs::geometry::BoundingBox& crop_box, bool inverse);
         void handleCropByEllipsoid(const glm::mat4& world_transform, const glm::vec3& radii, bool inverse);
         void handleRenamePly(const lfs::core::events::cmd::RenamePLY& event);
-        void handleReparentNode(const std::string& node_name, const std::string& new_parent_name);
-        void handleAddGroup(const std::string& name, const std::string& parent_name);
-        void handleDuplicateNode(const std::string& name);
-        void handleMergeGroup(const std::string& name);
         void handleAddCropBox(const std::string& node_name);
+        void handleAddCropBox(core::NodeId node_id);
         void handleAddCropEllipsoid(const std::string& node_name);
+        void handleAddCropEllipsoid(core::NodeId node_id);
         void handleResetCropBox();
         void handleResetEllipsoid();
         void updateCropBoxToFitScene(bool use_percentile);
         void updateEllipsoidToFitScene(bool use_percentile);
+        void scheduleConsolidatedCompaction();
+        [[nodiscard]] std::expected<GaussianDeletionPlan, std::string> buildSelectedGaussianDeletionPlan();
+        [[nodiscard]] std::expected<void, std::string> applySelectedGaussianDeletionPlan(const GaussianDeletionPlan& plan);
 
-        Scene scene_;
+        core::Scene scene_;
+        // Lock ordering: state_mutex_ before selection_.mutex() when both needed
         mutable std::mutex state_mutex_;
 
         ContentType content_type_ = ContentType::Empty;
@@ -235,28 +373,49 @@ namespace lfs::vis {
         // Cache for parameters
         std::optional<lfs::core::param::TrainingParameters> cached_params_;
 
-        std::set<std::string> selected_nodes_;
+        SelectionState selection_;
 
         // Clipboard for copy/paste (supports multi-selection)
         struct ClipboardEntry {
             std::unique_ptr<lfs::core::SplatData> data;
+            std::shared_ptr<lfs::core::MeshData> mesh;
             glm::mat4 transform{1.0f};
             struct HierarchyNode {
-                NodeType type = NodeType::SPLAT;
+                core::NodeType type = core::NodeType::SPLAT;
                 glm::mat4 local_transform{1.0f};
-                std::unique_ptr<CropBoxData> cropbox;
+                std::unique_ptr<core::CropBoxData> cropbox;
                 std::vector<HierarchyNode> children;
             };
             std::optional<HierarchyNode> hierarchy;
         };
         std::vector<ClipboardEntry> clipboard_;
         int clipboard_counter_ = 0;
+        enum class ClipboardKind {
+            None,
+            Nodes,
+            Gaussians,
+        };
+        ClipboardKind clipboard_kind_ = ClipboardKind::None;
 
         // Gaussian-level clipboard (selected Gaussians only)
         std::unique_ptr<lfs::core::SplatData> gaussian_clipboard_;
 
-        ClipboardEntry::HierarchyNode copyNodeHierarchy(const SceneNode* node);
-        void pasteNodeHierarchy(const ClipboardEntry::HierarchyNode& src, NodeId parent_id);
+        ClipboardEntry::HierarchyNode copyNodeHierarchy(const core::SceneNode* node);
+        void pasteNodeHierarchy(const ClipboardEntry::HierarchyNode& src, core::NodeId parent_id);
+
+        std::unique_ptr<lfs::training::PPISP> appearance_ppisp_;
+        std::unique_ptr<lfs::training::PPISPControllerPool> appearance_controller_pool_;
+
+        void beginSelectionPreview();
+
+        // Selection service (GPU-based rect/polygon/brush selection)
+        std::unique_ptr<SelectionService> selection_service_;
+        std::unique_ptr<op::SceneSnapshot> selection_preview_snapshot_;
+        std::optional<core::Scene::SelectionStateSnapshot> selection_preview_before_;
+        std::mutex consolidated_compaction_mutex_;
+        std::jthread consolidated_compaction_thread_;
+        bool consolidated_compaction_running_ = false;
+        bool consolidated_compaction_pending_ = false;
     };
 
 } // namespace lfs::vis

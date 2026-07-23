@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include "core/export.hpp"
+
 #include "core/parameters.hpp"
 #include <expected>
 #include <memory>
@@ -18,15 +20,29 @@ namespace lfs::core::args {
     struct ConvertMode {
         param::ConvertParameters params;
     };
+    struct Mesh2SplatMode {
+        param::Mesh2SplatParameters params;
+    };
+    struct PreprocessMode {
+        param::PreprocessParameters params;
+    };
     struct HelpMode {};
+    struct VersionMode {};
     struct WarmupMode {}; // JIT compile PTX kernels and exit
+    struct PluginMode {
+        enum class Command { CREATE,
+                             CHECK,
+                             LIST };
+        Command command;
+        std::string name;
+    };
 
-    using ParsedArgs = std::variant<TrainingMode, ConvertMode, HelpMode, WarmupMode>;
+    using ParsedArgs = std::variant<TrainingMode, ConvertMode, Mesh2SplatMode, PreprocessMode, HelpMode, VersionMode, WarmupMode, PluginMode>;
 
-    std::expected<ParsedArgs, std::string> parse_args(int argc, const char* const argv[]);
+    LFS_CORE_API std::expected<ParsedArgs, std::string> parse_args(int argc, const char* const argv[]);
 
     // Legacy interface - prefer parse_args()
-    std::expected<std::unique_ptr<param::TrainingParameters>, std::string>
+    LFS_CORE_API std::expected<std::unique_ptr<param::TrainingParameters>, std::string>
     parse_args_and_params(int argc, const char* const argv[]);
 
 } // namespace lfs::core::args

@@ -2,16 +2,34 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "core/assert.hpp"
+#include "core/cuda_error.hpp"
 #include "lfs/core/warp_reduce.cuh"
 #include "lfs/kernels/l1_loss.cuh"
+#include <type_traits>
+
+#include "kernel_stream.hpp"
 
 namespace lfs::training::kernels {
+    namespace {
+        constexpr float UINT8_TO_FLOAT = 1.0f / 255.0f;
+
+        template <typename T>
+        __device__ __forceinline__ float target_value(const T* data, size_t idx) {
+            if constexpr (std::is_same_v<std::remove_cv_t<T>, uint8_t>) {
+                return static_cast<float>(data[idx]) * UINT8_TO_FLOAT;
+            } else {
+                return static_cast<float>(data[idx]);
+            }
+        }
+    } // namespace
 
     // Fused kernel: computes gradient and accumulates sum(abs(diff)) in single pass
     // OPTIMIZED: Uses warp-level reductions (5-10× faster than CUB BlockReduce!)
+    template <typename TargetT>
     __global__ void fused_l1_kernel(
         const float* __restrict__ img1,
-        const float* __restrict__ img2,
+        const TargetT* __restrict__ img2,
         float* __restrict__ grad_out,
         float* __restrict__ partial_sums,
         size_t N,
@@ -25,7 +43,7 @@ namespace lfs::training::kernels {
              idx < N;
              idx += blockDim.x * gridDim.x) {
 
-            float diff = img1[idx] - img2[idx];
+            float diff = img1[idx] - target_value(img2, idx);
             float abs_diff = fabsf(diff);
 
             // Accumulate for loss
@@ -69,6 +87,38 @@ namespace lfs::training::kernels {
         }
     }
 
+    template <typename TargetT>
+    void launch_fused_l1_loss_impl(
+        const float* img1,
+        const TargetT* img2,
+        float* grad_out,
+        float* loss_out,
+        float* temp_buffer,
+        size_t N,
+        cudaStream_t stream) {
+        LFS_ASSERT_MSG(img1 != nullptr && img2 != nullptr && grad_out != nullptr &&
+                           loss_out != nullptr && temp_buffer != nullptr,
+                       "Fused L1 loss pointers must be non-null");
+        LFS_ASSERT_MSG(N > 0, "Fused L1 loss requires at least one element");
+        stream = resolve_stream(stream);
+
+        const int block_size = 256;
+        const int num_blocks = std::min((N + block_size - 1) / block_size, size_t(1024));
+
+        float grad_scale = 1.0f / static_cast<float>(N);
+
+        // Launch fused kernel
+        fused_l1_kernel<TargetT><<<num_blocks, block_size, 0, stream>>>(
+            img1, img2, grad_out, temp_buffer, N, grad_scale);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.l1.fused");
+
+        // Launch final reduction (normalize by N for mean)
+        float norm_factor = 1.0f / static_cast<float>(N);
+        final_reduce_kernel<<<1, block_size, 0, stream>>>(
+            temp_buffer, loss_out, num_blocks, norm_factor);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.l1.final_reduce");
+    }
+
     void launch_fused_l1_loss(
         const float* img1,
         const float* img2,
@@ -77,20 +127,20 @@ namespace lfs::training::kernels {
         float* temp_buffer,
         size_t N,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
+        launch_fused_l1_loss_impl(img1, img2, grad_out, loss_out, temp_buffer, N, stream);
+    }
 
-        const int block_size = 256;
-        const int num_blocks = std::min((N + block_size - 1) / block_size, size_t(1024));
-
-        float grad_scale = 1.0f / static_cast<float>(N);
-
-        // Launch fused kernel
-        fused_l1_kernel<<<num_blocks, block_size, 0, stream>>>(
-            img1, img2, grad_out, temp_buffer, N, grad_scale);
-
-        // Launch final reduction (normalize by N for mean)
-        float norm_factor = 1.0f / static_cast<float>(N);
-        final_reduce_kernel<<<1, block_size, 0, stream>>>(
-            temp_buffer, loss_out, num_blocks, norm_factor);
+    void launch_fused_l1_loss(
+        const float* img1,
+        const uint8_t* img2,
+        float* grad_out,
+        float* loss_out,
+        float* temp_buffer,
+        size_t N,
+        cudaStream_t stream) {
+        stream = resolve_stream(stream);
+        launch_fused_l1_loss_impl(img1, img2, grad_out, loss_out, temp_buffer, N, stream);
     }
 
 } // namespace lfs::training::kernels

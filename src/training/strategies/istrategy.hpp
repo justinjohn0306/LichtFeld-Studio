@@ -7,10 +7,18 @@
 #include "core/parameters.hpp"
 #include "core/splat_data.hpp"
 #include "optimizer/render_output.hpp"
+#include <exception>
 #include <istream>
+#include <memory>
 #include <ostream>
 
+namespace lfs::io {
+    class PipelinedImageLoader;
+}
+
 namespace lfs::training {
+
+    class CameraDataset;
 
     /**
      * @brief Strategy interface for Gaussian splatting optimization.
@@ -23,6 +31,8 @@ namespace lfs::training {
         virtual ~IStrategy() = default;
 
         virtual void initialize(const lfs::core::param::OptimizationParameters& optimParams) = 0;
+
+        virtual void pre_step(int /*iter*/, RenderOutput& /*render_output*/) {}
 
         virtual void post_backward(int iter, RenderOutput& render_output) = 0;
 
@@ -50,5 +60,29 @@ namespace lfs::training {
 
         // Reserve optimizer capacity for future growth (e.g., after checkpoint load)
         virtual void reserve_optimizer_capacity(size_t capacity) = 0;
+
+        // Update the strategy's cached optimization parameters after checkpoint params are resolved.
+        virtual void set_optimization_params(const lfs::core::param::OptimizationParameters&) {}
+
+        // Optional hook for strategies that need the training dataset (e.g., for view-based scoring)
+        virtual void set_training_dataset(std::shared_ptr<CameraDataset>) {}
+
+        virtual void set_image_loader(lfs::io::PipelinedImageLoader*) {}
+    };
+
+    class ICheckpointStateAdopter {
+    public:
+        virtual ~ICheckpointStateAdopter() = default;
+        virtual bool has_checkpoint_runtime_state() const noexcept = 0;
+        virtual bool can_adopt_checkpoint_state(const IStrategy& source) const noexcept = 0;
+        virtual void adopt_checkpoint_state(IStrategy& source) noexcept = 0;
+
+    protected:
+        template <typename Strategy>
+        static Strategy& checked_checkpoint_source(IStrategy& source) noexcept {
+            if (auto* typed_source = dynamic_cast<Strategy*>(&source))
+                return *typed_source;
+            std::terminate();
+        }
     };
 } // namespace lfs::training

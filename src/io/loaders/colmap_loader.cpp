@@ -4,18 +4,21 @@
 
 #include "io/loaders/colmap_loader.hpp"
 #include "core/camera.hpp"
+#include "core/error_reporter.hpp"
+#include "core/image_io.hpp"
 #include "core/logger.hpp"
+#include "core/path_utils.hpp"
 #include "core/point_cloud.hpp"
 #include "formats/colmap.hpp"
+#include "formats/ply.hpp"
 #include "io/error.hpp"
 #include "io/filesystem_utils.hpp"
-#include "training/dataset.hpp"
-#include <algorithm>
-#include <cctype>
+#include "io/loaders/loader_utils.hpp"
 #include <chrono>
 #include <filesystem>
 #include <format>
 #include <system_error>
+#include <vector>
 
 namespace lfs::io {
 
@@ -43,6 +46,10 @@ namespace lfs::io {
                               "COLMAP dataset must be a directory", path);
         }
 
+        if (is_load_cancel_requested(options)) {
+            return make_error(ErrorCode::CANCELLED, "COLMAP dataset load cancelled", path);
+        }
+
         // Report initial progress
         if (options.progress) {
             options.progress(0.0f, "Loading COLMAP dataset...");
@@ -60,6 +67,8 @@ namespace lfs::io {
         auto images_txt = find_file_in_paths(search_paths, "images.txt");
         auto points_txt = find_file_in_paths(search_paths, "points3D.txt");
 
+        auto points_ply = find_file_in_paths(search_paths, "points3D.ply");
+
         bool has_cameras = !cameras_bin.empty();
         bool has_images = !images_bin.empty();
         bool has_points = !points_bin.empty();
@@ -67,6 +76,18 @@ namespace lfs::io {
         bool has_cameras_text = !cameras_txt.empty();
         bool has_images_text = !images_txt.empty();
         bool has_points_text = !points_txt.empty();
+
+        bool has_points_ply = !points_ply.empty();
+
+        LOG_INFO("[COLMAP_LOAD] discovery path='{}' cameras_bin={} images_bin={} points_bin={} cameras_txt={} images_txt={} points_txt={} points_ply={}",
+                 lfs::core::path_to_utf8(path),
+                 has_cameras,
+                 has_images,
+                 has_points,
+                 has_cameras_text,
+                 has_images_text,
+                 has_points_text,
+                 has_points_ply);
 
         if ((has_cameras || has_images || has_points) &&
             (has_cameras_text || has_images_text || has_points_text)) {
@@ -95,7 +116,7 @@ namespace lfs::io {
 
         // Determine images folder
         std::string actual_images_folder = options.images_folder;
-        std::filesystem::path image_dir = path / actual_images_folder;
+        std::filesystem::path image_dir = path / lfs::core::utf8_to_path(actual_images_folder);
 
         auto is_dataset_root = [&](const std::filesystem::path& candidate) {
             if (candidate.empty()) {
@@ -113,6 +134,7 @@ namespace lfs::io {
 
         // If specified folder doesn't exist, check for flat structure
         if (!std::filesystem::exists(image_dir)) {
+            LOG_TIMER_DEBUG("COLMAP resolve image directory");
             const auto cameras_txt_parent =
                 cameras_txt.empty() ? std::filesystem::path{} : cameras_txt.parent_path();
             const auto cameras_bin_parent =
@@ -146,48 +168,68 @@ namespace lfs::io {
             }
         }
 
-        // Validation only mode
-        if (options.validate_only) {
+        try {
             if (options.progress) {
-                options.progress(100.0f, "COLMAP validation complete");
+                options.progress(10.0f, "Validating COLMAP dataset layout...");
             }
 
-            LOG_DEBUG("COLMAP validation successful");
+            throw_if_load_cancel_requested(options, "COLMAP dataset validation cancelled");
 
-            auto end_time = std::chrono::high_resolution_clock::now();
-            return LoadResult{
-                .data = LoadedScene{
-                    .cameras = nullptr,
-                    .point_cloud = nullptr},
-                .scene_center = Tensor::zeros({3}, Device::CPU),
-                .loader_used = name(),
-                .load_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time),
-                .warnings = (has_points || has_points_text) ? std::vector<std::string>{} : std::vector<std::string>{"No sparse point cloud found (points3D.bin|txt) - will use random initialization"}};
-        }
+            // Validation only mode
+            if (options.validate_only) {
+                LOG_TIMER_DEBUG("COLMAP validate_only dataset layout");
+                if (auto validation_result = validate_colmap_dataset_layout(path, actual_images_folder, options); !validation_result) {
+                    return std::unexpected(validation_result.error());
+                }
 
-        // Load cameras and images
-        if (options.progress) {
-            options.progress(20.0f, "Reading camera parameters...");
-        }
+                if (options.progress) {
+                    options.progress(100.0f, "COLMAP validation complete");
+                }
 
-        try {
+                LOG_DEBUG("COLMAP validation successful");
+
+                auto end_time = std::chrono::high_resolution_clock::now();
+                return LoadResult{
+                    .data = LoadedScene{
+                        .cameras = {},
+                        .point_cloud = nullptr},
+                    .scene_center = Tensor::zeros({3}, Device::CPU),
+                    .loader_used = name(),
+                    .load_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time),
+                    .warnings = (has_points || has_points_text || has_points_ply) ? std::vector<std::string>{} : std::vector<std::string>{"No sparse point cloud found (points3D.bin|txt|ply) - will use random initialization"}};
+            }
+
+            // Load cameras and images
+            if (options.progress) {
+                options.progress(20.0f, "Reading camera parameters...");
+            }
+
             std::vector<std::shared_ptr<Camera>> cameras;
             Tensor scene_center;
+            std::vector<std::string> warnings;
 
             if (has_cameras && has_images) {
                 LOG_DEBUG("Reading binary COLMAP data");
-                auto result = read_colmap_cameras_and_images(path, actual_images_folder);
+                LOG_TIMER_DEBUG("COLMAP read binary cameras and images");
+                auto result = read_colmap_cameras_and_images(path, actual_images_folder, options);
                 if (!result) {
                     return std::unexpected(result.error());
                 }
-                std::tie(cameras, scene_center) = std::move(*result);
+                std::tie(cameras, scene_center) = std::move(result->value);
+                for (auto& diagnostic : result->warnings) {
+                    warnings.push_back(diagnostic.message);
+                }
             } else if (has_cameras_text && has_images_text) {
                 LOG_DEBUG("Reading text COLMAP data");
-                auto result = read_colmap_cameras_and_images_text(path, actual_images_folder);
+                LOG_TIMER_DEBUG("COLMAP read text cameras and images");
+                auto result = read_colmap_cameras_and_images_text(path, actual_images_folder, options);
                 if (!result) {
                     return std::unexpected(result.error());
                 }
-                std::tie(cameras, scene_center) = std::move(*result);
+                std::tie(cameras, scene_center) = std::move(result->value);
+                for (auto& diagnostic : result->warnings) {
+                    warnings.push_back(diagnostic.message);
+                }
             } else {
                 return make_error(ErrorCode::MISSING_REQUIRED_FILES,
                                   "No valid COLMAP camera and image data found", path);
@@ -199,35 +241,124 @@ namespace lfs::io {
 
             LOG_DEBUG("Creating {} camera objects", cameras.size());
 
-            // Create dataset configuration
-            lfs::training::DatasetConfig dataset_config;
-            dataset_config.resize_factor = options.resize_factor;
-            dataset_config.max_width = options.max_width;
-            dataset_config.test_every = 8; // Default split behavior
-
-            // Create dataset with ALL images
-            auto dataset = std::make_shared<lfs::training::CameraDataset>(
-                std::move(cameras), dataset_config, lfs::training::CameraDataset::Split::ALL);
+            bool images_have_alpha = false;
+            {
+                LOG_TIMER_DEBUG("COLMAP detect image alpha");
+                images_have_alpha = detect_camera_alpha(cameras, options.cancel_requested);
+            }
 
             if (options.progress) {
                 options.progress(60.0f, "Loading point cloud...");
             }
 
-            // Load point cloud if it exists
+            throw_if_load_cancel_requested(options, "COLMAP point cloud load cancelled");
+
+            // Load point cloud: points3D.ply > points3D.bin > points3D.txt.
+            // Track filtering requires COLMAP sparse records, so prefer .bin/.txt when enabled.
             std::shared_ptr<PointCloud> point_cloud;
-            if (has_points) {
+            const bool use_colmap_track_filter = options.min_track_length > 0;
+            if (has_points_ply && !use_colmap_track_filter) {
+                LOG_INFO("Loading custom point cloud from points3D.ply");
+                LOG_TIMER_DEBUG("COLMAP load points3D.ply");
+                auto pc_result = load_ply_point_cloud(points_ply, options);
+                if (pc_result) {
+                    point_cloud = std::make_shared<PointCloud>(std::move(*pc_result));
+                    LOG_INFO("Loaded {} points from points3D.ply", point_cloud->size());
+                } else {
+                    if (is_load_cancel_requested(options)) {
+                        return std::unexpected(make_error(ErrorCode::CANCELLED, pc_result.error(), points_ply));
+                    }
+                    LOG_WARN("Failed to load points3D.ply: {}, falling back", pc_result.error());
+                }
+            } else if (has_points_ply && use_colmap_track_filter) {
+                if (has_points || has_points_text) {
+                    LOG_INFO("Skipping points3D.ply because COLMAP min track length filter is enabled");
+                } else {
+                    LOG_WARN("COLMAP min track length filter requested, but only points3D.ply is available; loading unfiltered PLY");
+                    LOG_TIMER_DEBUG("COLMAP load points3D.ply");
+                    auto pc_result = load_ply_point_cloud(points_ply, options);
+                    if (pc_result) {
+                        point_cloud = std::make_shared<PointCloud>(std::move(*pc_result));
+                        LOG_INFO("Loaded {} points from points3D.ply", point_cloud->size());
+                    } else {
+                        if (is_load_cancel_requested(options)) {
+                            return std::unexpected(make_error(ErrorCode::CANCELLED, pc_result.error(), points_ply));
+                        }
+                        LOG_WARN("Failed to load points3D.ply: {}, falling back", pc_result.error());
+                    }
+                }
+            }
+            if (!point_cloud && has_points) {
                 LOG_DEBUG("Loading binary point cloud");
-                auto loaded_pc = read_colmap_point_cloud(path);
-                point_cloud = std::make_shared<PointCloud>(std::move(loaded_pc));
+                LOG_TIMER_DEBUG("COLMAP load binary point cloud");
+                if (use_colmap_track_filter) {
+                    auto pc_result = read_colmap_point_cloud_with_stats(path, options);
+                    if (!pc_result) {
+                        return std::unexpected(pc_result.error());
+                    }
+                    auto loaded_pc = std::move(pc_result->value);
+                    point_cloud = std::make_shared<PointCloud>(std::move(loaded_pc.point_cloud));
+                    const std::string message = std::format(
+                        "COLMAP min track length filter: min track length {}, total points {}, after filtering {}",
+                        options.min_track_length,
+                        loaded_pc.total_points,
+                        loaded_pc.points_after_filtering);
+                    LOG_INFO("{}", message);
+                    warnings.push_back(message);
+                    for (auto& diagnostic : pc_result->warnings) {
+                        warnings.push_back(diagnostic.message);
+                    }
+                } else {
+                    auto pc_result = read_colmap_point_cloud(path, options);
+                    if (!pc_result) {
+                        return std::unexpected(pc_result.error());
+                    }
+                    point_cloud = std::make_shared<PointCloud>(std::move(pc_result->value));
+                    for (auto& diagnostic : pc_result->warnings) {
+                        warnings.push_back(diagnostic.message);
+                    }
+                }
                 LOG_INFO("Loaded {} points from COLMAP", point_cloud->size());
-            } else if (has_points_text) {
+            } else if (!point_cloud && has_points_text) {
                 LOG_DEBUG("Loading text point cloud");
-                auto loaded_pc = read_colmap_point_cloud_text(path);
-                point_cloud = std::make_shared<PointCloud>(std::move(loaded_pc));
+                LOG_TIMER_DEBUG("COLMAP load text point cloud");
+                if (use_colmap_track_filter) {
+                    auto pc_result = read_colmap_point_cloud_text_with_stats(path, options);
+                    if (!pc_result) {
+                        return std::unexpected(pc_result.error());
+                    }
+                    auto loaded_pc = std::move(pc_result->value);
+                    point_cloud = std::make_shared<PointCloud>(std::move(loaded_pc.point_cloud));
+                    const std::string message = std::format(
+                        "COLMAP min track length filter: min track length {}, total points {}, after filtering {}",
+                        options.min_track_length,
+                        loaded_pc.total_points,
+                        loaded_pc.points_after_filtering);
+                    LOG_INFO("{}", message);
+                    warnings.push_back(message);
+                    for (auto& diagnostic : pc_result->warnings) {
+                        warnings.push_back(diagnostic.message);
+                    }
+                } else {
+                    auto pc_result = read_colmap_point_cloud_text(path, options);
+                    if (!pc_result) {
+                        return std::unexpected(pc_result.error());
+                    }
+                    point_cloud = std::make_shared<PointCloud>(std::move(pc_result->value));
+                    for (auto& diagnostic : pc_result->warnings) {
+                        warnings.push_back(diagnostic.message);
+                    }
+                }
                 LOG_INFO("Loaded {} points from COLMAP text file", point_cloud->size());
-            } else {
+            } else if (!point_cloud) {
                 LOG_WARN("No point cloud found - will use random initialization");
                 point_cloud = std::make_shared<PointCloud>();
+            }
+
+            // Centralize scene
+            {
+                LOG_TIMER_DEBUG("COLMAP centralize scene");
+                scene_center = centralize_scene(cameras, point_cloud, options.centralize, scene_center);
             }
 
             if (options.progress) {
@@ -238,19 +369,23 @@ namespace lfs::io {
             auto load_time = std::chrono::duration_cast<std::chrono::milliseconds>(
                 end_time - start_time);
 
-            // Get scene center values and dataset size for logging BEFORE moving
             auto scene_center_cpu = scene_center.cpu();
             const float* sc_ptr = scene_center_cpu.ptr<float>();
-            size_t num_cameras = dataset->size();
+            size_t num_cameras = cameras.size();
 
             LoadResult result{
                 .data = LoadedScene{
-                    .cameras = std::move(dataset),
+                    .cameras = std::move(cameras),
                     .point_cloud = std::move(point_cloud)},
                 .scene_center = scene_center,
+                .images_have_alpha = images_have_alpha,
                 .loader_used = name(),
                 .load_time = load_time,
-                .warnings = (has_points || has_points_text) ? std::vector<std::string>{} : std::vector<std::string>{"No sparse point cloud found - using random initialization"}};
+                .warnings = std::move(warnings)};
+
+            if (!has_points && !has_points_text && !has_points_ply) {
+                result.warnings.push_back("No sparse point cloud found - using random initialization");
+            }
 
             LOG_INFO("COLMAP dataset loaded successfully in {}ms", load_time.count());
             LOG_INFO("  - {} cameras", num_cameras);
@@ -259,6 +394,14 @@ namespace lfs::io {
 
             return result;
 
+        } catch (const LoadCancelledError& e) {
+            return make_error(ErrorCode::CANCELLED, e.what(), path);
+        } catch (const lfs::Exception& e) {
+            lfs::Error error = lfs::Error(e.error())
+                                   .with_context("load COLMAP dataset", LFS_SOURCE_SITE_CURRENT(),
+                                                 lfs::SmallFields{}.add("path", lfs::core::path_to_utf8(path)));
+            lfs::core::ErrorReporter::get().report(error, lfs::core::ReportChannel::OwnerLog);
+            return std::unexpected(from_lfs_error(error));
         } catch (const std::exception& e) {
             return make_error(ErrorCode::CORRUPTED_DATA,
                               std::format("Failed to load COLMAP dataset: {}", e.what()), path);

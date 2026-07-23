@@ -4,35 +4,43 @@
 
 #pragma once
 
+#include "core/export.hpp"
 #include "core/tensor.hpp"
 #include "io/error.hpp"
 #include <chrono>
+#include <cstddef>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
 // Forward declarations only - hide implementation details
 namespace lfs::core {
+    class Camera;
     class SplatData;
     struct PointCloud;
+    struct MeshData;
 } // namespace lfs::core
-
-namespace lfs::training {
-    class CameraDataset;
-} // namespace lfs::training
 
 namespace lfs::io {
 
     // Import types from lfs::core for convenience
+    using lfs::core::MeshData;
     using lfs::core::PointCloud;
     using lfs::core::SplatData;
     using lfs::core::Tensor;
+    using SplatTensorAllocator = std::function<Tensor(lfs::core::TensorShape shape,
+                                                      size_t capacity,
+                                                      lfs::core::DataType dtype,
+                                                      std::string_view name)>;
 
     // Progress callback type
     using ProgressCallback = std::function<void(float percentage, const std::string& message)>;
+    using CancelCallback = std::function<bool()>;
 
     // Dataset type enum
     enum class DatasetType {
@@ -41,23 +49,57 @@ namespace lfs::io {
         Transforms
     };
 
+    // Centralize dataset enum
+    enum class CentralizeDataset {
+        Off,
+        ByPointCloud,
+        ByCameras
+    };
+
     // Public types that clients need
     struct LoadOptions {
         int resize_factor = -1;
-        int max_width = 3840;
+        int max_width = 0;
         std::string images_folder = "images";
+        int min_track_length = 0;
         bool validate_only = false;
+        CentralizeDataset centralize = CentralizeDataset::Off;
         ProgressCallback progress = nullptr;
+        CancelCallback cancel_requested = nullptr;
+        SplatTensorAllocator splat_tensor_allocator = {};
     };
 
+    class LoadCancelledError : public std::runtime_error {
+    public:
+        using std::runtime_error::runtime_error;
+    };
+
+    // Re-home a splat's tensors into the Vulkan-external allocator the renderer requires (it
+    // rejects an input-copy fallback). No-op if already allocator-backed or allocator is empty.
+    // The loader runs this for file imports; in-memory callers (e.g. the Python API) must too.
+    [[nodiscard]] LFS_IO_API Result<void> migrateSplatTensorsToAllocator(
+        SplatData& model, const SplatTensorAllocator& allocator);
+
+    [[nodiscard]] inline bool is_load_cancel_requested(const LoadOptions& options) {
+        return options.cancel_requested && options.cancel_requested();
+    }
+
+    inline void throw_if_load_cancel_requested(const LoadOptions& options,
+                                               std::string_view message = "Load cancelled") {
+        if (is_load_cancel_requested(options)) {
+            throw LoadCancelledError(std::string(message));
+        }
+    }
+
     struct LoadedScene {
-        std::shared_ptr<lfs::training::CameraDataset> cameras;
+        std::vector<std::shared_ptr<lfs::core::Camera>> cameras;
         std::shared_ptr<PointCloud> point_cloud;
     };
 
     struct LoadResult {
-        std::variant<std::shared_ptr<SplatData>, LoadedScene> data;
+        std::variant<std::shared_ptr<SplatData>, LoadedScene, std::shared_ptr<MeshData>> data;
         Tensor scene_center;
+        bool images_have_alpha = false;
         std::string loader_used;
         std::chrono::milliseconds load_time{0};
         std::vector<std::string> warnings;
@@ -69,7 +111,7 @@ namespace lfs::io {
      * This class provides a clean facade over all loading functionality.
      * All implementation details are hidden behind this interface.
      */
-    class Loader {
+    class LFS_IO_API Loader {
     public:
         /**
          * @brief Create a loader instance
@@ -82,6 +124,16 @@ namespace lfs::io {
          * @return true if dataset, false if single file or not loadable
          */
         static bool isDatasetPath(const std::filesystem::path& path);
+
+        /**
+         * @brief Check if path is a COLMAP sparse reconstruction folder
+         * @param path Directory to check
+         * @return true if directory contains cameras.bin/txt and images.bin/txt
+         *
+         * This can detect sparse COLMAP folders for camera-only imports
+         * (where images folder may not exist).
+         */
+        static bool isColmapSparsePath(const std::filesystem::path& path);
 
         /**
          * @brief Determine the type of dataset at the given path
@@ -126,10 +178,11 @@ namespace lfs::io {
 
     /// Check if PLY contains Gaussian splat properties (opacity, scaling, rotation)
     /// Returns false for simple point clouds (xyz + colors only)
-    bool is_gaussian_splat_ply(const std::filesystem::path& filepath);
+    LFS_IO_API bool is_gaussian_splat_ply(const std::filesystem::path& filepath);
 
-    /// Load PLY as simple point cloud (xyz + optional colors)
+    /// Load PLY as simple point cloud (xyz + optional colors and normals)
     /// Use this for PLY files that are NOT Gaussian splats
-    std::expected<PointCloud, std::string> load_ply_point_cloud(const std::filesystem::path& filepath);
+    LFS_IO_API std::expected<PointCloud, std::string> load_ply_point_cloud(const std::filesystem::path& filepath,
+                                                                           const LoadOptions& options = {});
 
 } // namespace lfs::io

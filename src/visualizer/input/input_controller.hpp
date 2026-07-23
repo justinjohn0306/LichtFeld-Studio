@@ -5,37 +5,58 @@
 #pragma once
 
 #include "core/events.hpp"
+#include "core/export.hpp"
 #include "core/services.hpp"
 #include "input/input_bindings.hpp"
 #include "input/input_types.hpp"
 #include "internal/viewport.hpp"
-#include <GLFW/glfw3.h>
+#include "rendering/rendering_types.hpp"
+#include <array>
 #include <chrono>
+#include <cstddef>
 #include <glm/glm.hpp>
 #include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+struct SDL_Window;
+struct SDL_Cursor;
 
 namespace lfs::vis {
 
+    namespace input {
+        class InputRouter;
+    }
+
     // Forward declarations
     namespace tools {
-        class BrushTool;
         class AlignTool;
         class SelectionTool;
     } // namespace tools
     class ToolContext;
 
-    class InputController {
+    class LFS_VIS_API InputController {
     public:
-        InputController(GLFWwindow* window, Viewport& viewport);
+        enum class CameraNavigationMode {
+            Orbit,
+            Trackball,
+            FPV,
+            Drone
+        };
+
+        // Single source of truth for the mode <-> name mapping used by the
+        // GUI toolbar and the Python API; fromName also accepts the aliases
+        // "turntable" and "fly".
+        [[nodiscard]] static const char* cameraNavigationModeName(CameraNavigationMode mode);
+        [[nodiscard]] static std::optional<CameraNavigationMode>
+        cameraNavigationModeFromName(std::string_view name);
+
+        InputController(SDL_Window* window, Viewport& viewport);
         ~InputController();
 
-        // Setup - MUST be called AFTER ImGui is initialized!
         void initialize();
-
-        // Set brush tool
-        void setBrushTool(std::shared_ptr<tools::BrushTool> tool) {
-            brush_tool_ = tool;
-        }
 
         // Set align tool
         void setAlignTool(std::shared_ptr<tools::AlignTool> tool) {
@@ -57,6 +78,16 @@ namespace lfs::vis {
             viewport_bounds_ = {x, y, w, h};
         }
 
+        void setFocusedSplitPanel(const SplitViewPanelId panel) {
+            focusSplitPanel(panel);
+        }
+        void applySplitterCursorOverride() const;
+
+        void toggleIndependentSplitView() {
+            lfs::core::events::cmd::ToggleIndependentSplitView{.viewport = &viewport_}.emit();
+            focusSplitPanel(SplitViewPanelId::Left);
+        }
+
         // Set special input modes
         void setPointCloudMode(bool enabled) {
             point_cloud_mode_ = enabled;
@@ -66,6 +97,11 @@ namespace lfs::vis {
         input::InputBindings& getBindings() { return bindings_; }
         const input::InputBindings& getBindings() const { return bindings_; }
         void loadInputProfile(const std::string& name) { bindings_.loadProfile(name); }
+        [[nodiscard]] CameraNavigationMode cameraNavigationMode() const { return camera_navigation_mode_; }
+        void setCameraNavigationMode(CameraNavigationMode mode);
+        [[nodiscard]] bool cameraViewSnapEnabled() const { return camera_view_snap_enabled_; }
+        void setCameraViewSnapEnabled(bool enabled) { camera_view_snap_enabled_ = enabled; }
+        [[nodiscard]] static InputController* instance() { return instance_; }
 
         // Update function for continuous input (WASD movement and inertia)
         void update(float delta_time);
@@ -77,56 +113,91 @@ namespace lfs::vis {
             const bool camera_drag = drag_mode_ == DragMode::Orbit ||
                                      drag_mode_ == DragMode::Pan ||
                                      drag_mode_ == DragMode::Rotate;
-            return movement_active || camera_drag;
+            auto& keyboard_camera = activeKeyboardViewport().camera;
+            const bool orbit_coasting =
+                orbit_coast_viewport_ && orbit_coast_viewport_->camera.hasOrbitMomentum();
+            const bool pan_coasting =
+                pan_coast_viewport_ && pan_coast_viewport_->camera.hasPanMomentum();
+            const bool wasd_coasting =
+                (wasd_momentum_viewport_ && wasd_momentum_viewport_->camera.hasWasdMomentum()) ||
+                keyboard_camera.hasWasdMomentum();
+            const bool drone_settling =
+                (wasd_momentum_viewport_ && wasd_momentum_viewport_->camera.hasDroneMotion()) ||
+                keyboard_camera.hasDroneMotion();
+            return movement_active || camera_drag || orbit_coasting || pan_coasting ||
+                   keyboard_camera.isGliding() || wasd_coasting || drone_settling;
         }
+        [[nodiscard]] bool hasViewportKeyboardFocus() const;
+        [[nodiscard]] bool isViewportPoint(double x, double y) const { return isInViewport(x, y); }
+        void setInputRouter(input::InputRouter* router) { input_router_ = router; }
 
         // Node rectangle selection state (for rendering)
         [[nodiscard]] bool isNodeRectDragging() const { return is_node_rect_dragging_; }
         [[nodiscard]] glm::vec2 getNodeRectStart() const { return node_rect_start_; }
         [[nodiscard]] glm::vec2 getNodeRectEnd() const { return node_rect_end_; }
 
-        void handleFileDrop(const std::vector<std::string>& paths);
-
-    private:
-        // Store original ImGui callbacks so we can chain
-        struct {
-            GLFWmousebuttonfun mouse_button = nullptr;
-            GLFWcursorposfun cursor_pos = nullptr;
-            GLFWscrollfun scroll = nullptr;
-            GLFWkeyfun key = nullptr;
-            GLFWdropfun drop = nullptr;
-            GLFWwindowfocusfun focus = nullptr;
-        } imgui_callbacks_;
-
-        // Our callbacks that chain to ImGui
-        static void mouseButtonCallback(GLFWwindow* w, int button, int action, int mods);
-        static void cursorPosCallback(GLFWwindow* w, double x, double y);
-        static void scrollCallback(GLFWwindow* w, double xoff, double yoff);
-        static void keyCallback(GLFWwindow* w, int key, int scancode, int action, int mods);
-        static void dropCallback(GLFWwindow* w, int count, const char** paths);
-        static void windowFocusCallback(GLFWwindow* w, int focused);
-
-        // Internal handlers
+        // Event handlers (called by WindowManager)
         void handleMouseButton(int button, int action, double x, double y);
         void handleMouseMove(double x, double y);
         void handleScroll(double xoff, double yoff);
         void handleKey(int key, int action, int mods);
+        void handleKey(int physical_key, int logical_key, int scancode, int action, int mods);
+        void handleFileDrop(const std::vector<std::string>& paths);
+        void onWindowFocusLost();
+        bool focusSelection();
+
+    private:
+        struct PanelInteractionState {
+            SplitViewPanelId panel = SplitViewPanelId::Left;
+            Viewport* viewport = nullptr;
+            float local_x = 0.0f;
+            float local_y = 0.0f;
+            float width = 0.0f;
+            float height = 0.0f;
+
+            [[nodiscard]] bool valid() const { return viewport != nullptr && width > 0.0f && height > 0.0f; }
+        };
+
         void handleGoToCamView(const lfs::core::events::cmd::GoToCamView& event);
-        void handleFocusSelection();
+        bool handleFocusSelection(Viewport& target_viewport);
+        bool computeWholeSceneBounds(glm::vec3& out_min, glm::vec3& out_max,
+                                     bool use_percentile = false) const;
+        float sceneExtent();
+        void maybeInitializeDepthViewRange();
 
         // WASD processing with proper frame timing
         void processWASDMovement();
 
         // Helpers
         bool isInViewport(double x, double y) const;
+        bool isPointerOverBlockingUi(double x, double y) const;
+        bool isPointerOverUiHover(double x, double y) const;
         bool shouldCameraHandleInput() const;
+        void selectCameraByUid(int uid);
         void updateCameraSpeed(bool increase);
         void updateZoomSpeed(bool increase);
-        void publishCameraMove();
-        bool isNearSplitter(double x) const;
+        void publishCameraMove(Viewport* target_viewport = nullptr);
+        bool isNearSplitter(double x, double y) const;
         int getModifierKeys() const;
+        bool isKeyPressed(int app_key) const;
+        bool isMouseButtonPressed(int app_button) const;
+        [[nodiscard]] bool isIndependentSplitViewActive() const;
+        [[nodiscard]] SplitViewPanelId splitPanelForScreenX(double x) const;
+        [[nodiscard]] std::optional<PanelInteractionState> resolvePanelInteraction(double x, double y);
+        void focusSplitPanel(SplitViewPanelId panel);
+        [[nodiscard]] Viewport& activeKeyboardViewport();
+        [[nodiscard]] const Viewport& activeKeyboardViewport() const;
         glm::vec3 unprojectScreenPoint(double x, double y, float fallback_distance = 5.0f) const;
+        std::pair<glm::vec3, glm::vec3> computePickRay(double x, double y) const;
         input::ToolMode getCurrentToolMode() const;
+        void clearViewportDragState();
+        void clearWasdMomentumViewport();
+        void clearSelectedCameraContextMenuGesture();
+        void beginPanDrag(const PanelInteractionState& interaction, int button, double x, double y);
+        [[nodiscard]] bool canOpenSelectedCameraContextMenu(int hovered_camera_uid) const;
+        void openSelectedCameraContextMenu(int hovered_camera_uid, float screen_x, float screen_y);
+        void applyCameraTrainingStateToSelection(const std::vector<std::string>& selected_names, bool enabled);
+        bool snapViewportToNearestAxis(Viewport& target_viewport, SplitViewPanelId panel);
 
         // Training pause/resume helpers
         void onCameraMovementStart();
@@ -134,14 +205,13 @@ namespace lfs::vis {
         void checkCameraMovementTimeout();
 
         // Core state
-        GLFWwindow* window_;
+        SDL_Window* window_;
         Viewport& viewport_;
 
         // Input bindings for customizable hotkeys
         input::InputBindings bindings_;
 
         // Tool support
-        std::shared_ptr<tools::BrushTool> brush_tool_;
         std::shared_ptr<tools::AlignTool> align_tool_;
         std::shared_ptr<tools::SelectionTool> selection_tool_;
         ToolContext* tool_context_ = nullptr;
@@ -158,25 +228,71 @@ namespace lfs::vis {
             Rotate,
             Orbit,
             Gizmo,
-            Splitter,
-            Brush
+            Splitter
         };
         DragMode drag_mode_ = DragMode::None;
+        CameraNavigationMode camera_navigation_mode_ = CameraNavigationMode::Orbit;
+        bool camera_view_snap_enabled_ = false;
         int drag_button_ = -1;
         glm::dvec2 last_mouse_pos_{0, 0};
         float splitter_start_pos_ = 0.5f;
         double splitter_start_x_ = 0.0;
+        Viewport* drag_viewport_ = nullptr;
+        Viewport* orbit_coast_viewport_ = nullptr;
+        Viewport* pan_coast_viewport_ = nullptr;
+        Viewport* wasd_momentum_viewport_ = nullptr;
+
+        // Cached whole-scene radius (half the bounds diagonal) that scales WASD
+        // speed and caps pan distance by splat size; 0 means "recompute" (after scene
+        // load/clear).
+        float scene_extent_ = 0.0f;
+        // One-shot guard: the depth-view range is seeded from the trimmed scene
+        // radius the first frame the extent is known after a load, then left to
+        // the user. Reset on scene load/clear.
+        bool depth_range_initialized_ = false;
+        SplitViewPanelId drag_split_panel_ = SplitViewPanelId::Left;
+        SplitViewPanelId node_rect_panel_ = SplitViewPanelId::Left;
+        int node_rect_button_ = -1;
+        bool node_point_pick_enabled_ = false;
+        bool node_rect_select_enabled_ = false;
+        struct PendingClickDragGesture {
+            bool active = false;
+            int button = -1;
+            int mods = input::MODIFIER_NONE;
+            input::Action click_action = input::Action::NONE;
+            input::Action drag_action = input::Action::NONE;
+            glm::dvec2 press_pos{0.0, 0.0};
+        };
+        PendingClickDragGesture pending_click_drag_;
+        input::Action forced_mouse_press_action_ = input::Action::NONE;
+        int text_input_viewport_click_button_ = -1;
+        struct PendingCameraContextMenuGesture {
+            bool active = false;
+            bool released = false;
+            int camera_uid = -1;
+            glm::dvec2 press_pos{0.0, 0.0};
+            glm::dvec2 release_pos{0.0, 0.0};
+            std::chrono::steady_clock::time_point release_time{};
+            PanelInteractionState interaction{};
+        } pending_camera_context_menu_;
 
         // Key states
-        bool key_r_pressed_ = false;
         bool key_ctrl_pressed_ = false;
         bool key_alt_pressed_ = false;
-        bool keys_movement_[6] = {false, false, false, false, false, false}; // fwd, left, back, right, down, up
+        // Non-modifier keys currently held in press order (logical keycodes).
+        // Used to resolve chord-bound scroll/drag triggers, e.g. R+Scroll for
+        // Camera Roll. Newest held key wins when multiple chords are possible.
+        std::vector<int> held_keys_;
+        bool keys_movement_[6] = {false, false, false, false, false, false}; // fwd, left, back, right, up, down
 
-        // Cached movement key bindings (refreshed when bindings change)
+        // Cached movement key bindings, indexed by ToolMode. Refreshed on
+        // binding change; read site picks the cache for the current tool mode
+        // so a key rebound only in GLOBAL doesn't leak into tool-local modes.
         struct MovementKeys {
             int forward = -1, backward = -1, left = -1, right = -1, up = -1, down = -1;
-        } movement_keys_;
+        };
+        std::array<MovementKeys, input::kToolModeCount> movement_keys_per_mode_{};
+        [[nodiscard]] const MovementKeys& currentMovementKeys() const;
         void refreshMovementKeyCache();
 
         // Special modes
@@ -191,7 +307,6 @@ namespace lfs::vis {
         bool training_was_paused_by_camera_ = false;
         std::chrono::steady_clock::time_point last_camera_movement_time_;
         static constexpr auto camera_movement_timeout_ = std::chrono::milliseconds(500);
-        bool gt_comparison_active_ = false;
 
         // Frame timing for WASD movement
         std::chrono::high_resolution_clock::time_point last_frame_time_;
@@ -203,8 +318,8 @@ namespace lfs::vis {
             Hand
         };
         CursorType current_cursor_ = CursorType::Default;
-        GLFWcursor* resize_cursor_ = nullptr;
-        GLFWcursor* hand_cursor_ = nullptr;
+        SDL_Cursor* resize_cursor_ = nullptr;
+        SDL_Cursor* hand_cursor_ = nullptr;
 
         // Double-click detection
         static constexpr double DOUBLE_CLICK_TIME = 0.3;
@@ -214,8 +329,11 @@ namespace lfs::vis {
         int last_camview_ = -1;
         int hovered_camera_id_ = -1;
         int last_clicked_camera_id_ = -1;
+        int pressed_camera_frustum_id_ = -1;
+        bool press_selected_camera_frustum_ = false;
         std::chrono::steady_clock::time_point last_click_time_;
         glm::dvec2 last_click_pos_{0, 0};
+        glm::dvec2 pressed_camera_frustum_pos_{0, 0};
 
         // General double-click tracking
         std::chrono::steady_clock::time_point last_general_click_time_;
@@ -227,6 +345,18 @@ namespace lfs::vis {
         glm::vec2 node_rect_start_{0.0f};
         glm::vec2 node_rect_end_{0.0f};
 
+        // Event bridge subscriptions
+        std::size_t go_to_cam_view_handler_id_ = 0;
+        std::size_t reset_camera_handler_id_ = 0;
+        std::size_t dataset_load_completed_handler_id_ = 0;
+        std::size_t window_focus_lost_handler_id_ = 0;
+        std::size_t split_toggle_handler_id_ = 0;
+        std::size_t independent_split_toggle_handler_id_ = 0;
+        std::size_t gt_comparison_toggle_handler_id_ = 0;
+        std::size_t scene_cleared_handler_id_ = 0;
+        std::size_t scene_loaded_handler_id_ = 0;
+
+        input::InputRouter* input_router_ = nullptr;
         static InputController* instance_;
     };
 

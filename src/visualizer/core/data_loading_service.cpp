@@ -3,15 +3,33 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/data_loading_service.hpp"
+#include "core/checkpoint_format.hpp"
 #include "core/logger.hpp"
 #include "core/parameter_manager.hpp"
 #include "core/path_utils.hpp"
 #include "core/services.hpp"
 #include "scene/scene_manager.hpp"
 #include <algorithm>
+#include <chrono>
 #include <stdexcept>
 
 namespace lfs::vis {
+    namespace {
+        std::filesystem::path displayParentPath(const std::filesystem::path& path) {
+            const auto parent = path.parent_path();
+            if (!parent.empty()) {
+                return parent;
+            }
+
+            std::error_code ec;
+            const auto absolute = std::filesystem::absolute(path, ec);
+            if (!ec) {
+                return absolute.parent_path();
+            }
+
+            return {};
+        }
+    } // namespace
 
     DataLoadingService::DataLoadingService(SceneManager* scene_manager)
         : scene_manager_(scene_manager) {
@@ -46,12 +64,25 @@ namespace lfs::vis {
         }
 
         if (scene_manager_->getContentType() == SceneManager::ContentType::Dataset) {
-            scene_manager_->clear();
+            if (!scene_manager_->clear()) {
+                return;
+            }
         }
-        scene_manager_->changeContentType(SceneManager::ContentType::SplatFiles);
 
-        const std::string name = lfs::core::path_to_utf8(path.stem());
-        scene_manager_->addSplatFile(path, name);
+        try {
+            if (scene_manager_->getContentType() == SceneManager::ContentType::SplatFiles) {
+                const std::string name = lfs::core::path_to_utf8(path.stem());
+                scene_manager_->addSplatFile(path, name);
+                return;
+            }
+
+            // First import into an empty scene must take the full load path so SceneLoaded,
+            // application-scene binding, and UI state all refresh together.
+            scene_manager_->loadSplatFile(path);
+        } catch (const std::exception& e) {
+            LOG_ERROR("Failed to load {}: {}", lfs::core::path_to_utf8(path), e.what());
+            lfs::core::events::state::SplatFileLoadFailed{.path = path, .error = e.what()}.emit();
+        }
     }
 
     void DataLoadingService::handleLoadCheckpointForTrainingCommand(
@@ -124,13 +155,13 @@ namespace lfs::vis {
 
             LOG_INFO("Successfully loaded PLY: {} (from: {})",
                      lfs::core::path_to_utf8(path.filename()),
-                     lfs::core::path_to_utf8(path.parent_path()));
+                     lfs::core::path_to_utf8(displayParentPath(path)));
 
             return {};
         } catch (const std::exception& e) {
             std::string error_msg = std::format("Failed to load PLY: {}", e.what());
             LOG_ERROR("{} (Path: {})", error_msg, lfs::core::path_to_utf8(path));
-            throw std::runtime_error(error_msg);
+            return std::unexpected(error_msg);
         }
     }
 
@@ -145,13 +176,13 @@ namespace lfs::vis {
 
             LOG_INFO("Successfully loaded SOG: {} (from: {})",
                      lfs::core::path_to_utf8(path.filename()),
-                     lfs::core::path_to_utf8(path.parent_path()));
+                     lfs::core::path_to_utf8(displayParentPath(path)));
 
             return {};
         } catch (const std::exception& e) {
             std::string error_msg = std::format("Failed to load SOG: {}", e.what());
             LOG_ERROR("{} (Path: {})", error_msg, lfs::core::path_to_utf8(path));
-            throw std::runtime_error(error_msg);
+            return std::unexpected(error_msg);
         }
     }
 
@@ -175,8 +206,82 @@ namespace lfs::vis {
         } catch (const std::exception& e) {
             std::string error_msg = std::format("Failed to load splat file: {}", e.what());
             LOG_ERROR("{} (Path: {})", error_msg, lfs::core::path_to_utf8(path));
-            throw std::runtime_error(error_msg);
+            return std::unexpected(error_msg);
         }
+    }
+
+    std::expected<void, std::string>
+    DataLoadingService::loadSplatFiles(const std::vector<std::filesystem::path>& paths) {
+        if (paths.empty()) {
+            return std::unexpected("No splat files were provided");
+        }
+
+        const auto started_at = std::chrono::steady_clock::now();
+
+        size_t loaded = 0;
+        size_t failed = 0;
+        std::vector<std::string> failures;
+        failures.reserve(paths.size());
+
+        // Scene tensor allocation and attachment remain on the graphics thread. The
+        // PLY loader already issues sequential OS read-ahead and uses a fused decode;
+        // concurrent full-file walkers only contend for storage while multiplying its
+        // large host staging footprint.
+        for (size_t index = 0; index < paths.size(); ++index) {
+            std::string load_error;
+            if (loaded == 0) {
+                if (auto result = loadSplatFile(paths[index]); !result) {
+                    load_error = result.error();
+                }
+            } else {
+                try {
+                    addSplatFileToScene(paths[index]);
+                } catch (const std::exception& error) {
+                    load_error = error.what();
+                }
+            }
+
+            if (load_error.empty()) {
+                ++loaded;
+                continue;
+            }
+
+            ++failed;
+            failures.emplace_back(std::format("{}: {}",
+                                              lfs::core::path_to_utf8(paths[index].filename()),
+                                              load_error));
+            LOG_ERROR("Failed to load {}: {}",
+                      lfs::core::path_to_utf8(paths[index]), load_error);
+            lfs::core::events::state::SplatFileLoadFailed{
+                .path = paths[index],
+                .error = load_error}
+                .emit();
+        }
+
+        if (loaded > 1) {
+            scene_manager_->consolidateNodeModels();
+        }
+
+        const double elapsed_seconds = std::chrono::duration<double>(
+                                           std::chrono::steady_clock::now() - started_at)
+                                           .count();
+        LOG_INFO("Splat batch loaded {}/{} files in {:.3f}s ({} failed)",
+                 loaded, paths.size(), elapsed_seconds, failed);
+
+        if (loaded == 0) {
+            std::string error = "No splat files could be loaded";
+            if (!failures.empty()) {
+                error += ": ";
+                for (size_t index = 0; index < failures.size(); ++index) {
+                    if (index > 0) {
+                        error += "; ";
+                    }
+                    error += failures[index];
+                }
+            }
+            return std::unexpected(std::move(error));
+        }
+        return {};
     }
 
     void DataLoadingService::addPLYToScene(const std::filesystem::path& path) {
@@ -248,16 +353,18 @@ namespace lfs::vis {
 
         // Load through scene manager (it emits DatasetLoadCompleted event on success/failure)
         LOG_DEBUG("Passing dataset to scene manager with parameters");
-        scene_manager_->loadDataset(path, params_);
-
-        return {};
+        return scene_manager_->loadDataset(path, params_);
     }
 
-    void DataLoadingService::clearScene() {
+    bool DataLoadingService::clearScene() {
         try {
             LOG_DEBUG("Clearing scene");
-            scene_manager_->clear();
+            if (!scene_manager_->clear()) {
+                LOG_WARN("Scene clear request was rejected");
+                return false;
+            }
             LOG_INFO("Scene cleared");
+            return true;
         } catch (const std::exception& e) {
             LOG_ERROR("Failed to clear scene: {}", e.what());
             throw std::runtime_error(std::format("Failed to clear scene: {}", e.what()));
@@ -270,14 +377,21 @@ namespace lfs::vis {
         const std::filesystem::path& output_path) {
         LOG_TIMER("LoadCheckpointForTraining");
         try {
-            // Override dataset/output paths if provided by user
+            // Load checkpoint params first to preserve init_path and other settings
+            auto checkpoint_params_result = lfs::core::load_checkpoint_params(checkpoint_path);
             lfs::core::param::TrainingParameters params;
+            if (checkpoint_params_result) {
+                params = *checkpoint_params_result;
+            }
+            // Override dataset/output paths if provided by user
             if (!dataset_path.empty()) {
                 params.dataset.data_path = dataset_path;
             }
             if (!output_path.empty()) {
                 params.dataset.output_path = output_path;
             }
+            // Update our stored params so getParameters() returns checkpoint params
+            params_ = params;
             scene_manager_->loadCheckpointForTraining(checkpoint_path, params);
             return {};
         } catch (const std::exception& e) {
