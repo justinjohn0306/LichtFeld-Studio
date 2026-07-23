@@ -401,7 +401,7 @@ else()
 endif()
 
 enable_language(CUDA)
-find_package(CUDAToolkit 12.8 REQUIRED)
+find_package(CUDAToolkit 13.0 REQUIRED)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --extended-lambda --expt-relaxed-constexpr")
 if(WIN32)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --diag-suppress 221,1394,1388 -Xcompiler=/wd4267 -Xcompiler=/Zc:preprocessor")
@@ -1585,3 +1585,4 @@ elseif(SCCACHE_PROGRAM)
         COMMENT "Cleaning build and resetting sccache stats"
     )
 endif()
+

@@ -22,7 +22,7 @@ LichtFeld-Studio One-Shot Build Script
 Usage: .\build_lichtfeld.ps1 [options]
 
 This script automatically:
-  1. Verifies build prerequisites (VS 2022, CUDA 12.8, CMake, Git)
+  1. Verifies build prerequisites (VS 2022, CUDA 13.0, CMake, Git)
   2. Sets up vcpkg in the parent directory
   3. Downloads LibTorch (Debug & Release) if missing
   4. Initializes git submodules
@@ -287,18 +287,18 @@ function Test-BuildEnvironment {
     }
 
     # Check 4: CUDA Toolkit
-    Write-Host "[4/$TotalChecks] Checking CUDA Toolkit 12.8..." -ForegroundColor Yellow
+    Write-Host "[4/$TotalChecks] Checking CUDA Toolkit 13.0 or newer..." -ForegroundColor Yellow
     if (Test-Command "nvcc") {
         try {
             $NvccOutput = nvcc --version 2>&1 | Select-String "release"
             $CudaVersion = ($NvccOutput -split "release ")[1] -split "," | Select-Object -First 1
 
-            if ($CudaVersion -match "12\.") {
+            if ($CudaVersionParsed -ge [version]"13.0") {
                 Write-Status "CUDA Toolkit (nvcc)" $true "v$CudaVersion"
             } else {
                 Write-Status "CUDA Toolkit (nvcc)" $false "v$CudaVersion" `
-                    "CUDA 12.x is required (found $CudaVersion)" `
-                    "Download CUDA 12.8 from: https://developer.nvidia.com/cuda-12-8-0-download-archive"
+                    "CUDA 13.0 or newer is required (found $CudaVersion)" `
+                    "Download CUDA 13.0 or newer from: https://developer.nvidia.com/cuda-downloads"
             }
         } catch {
             Write-Status "CUDA Toolkit (nvcc)" $true "Found (version check failed)"
@@ -306,7 +306,7 @@ function Test-BuildEnvironment {
     } else {
         Write-Status "CUDA Toolkit (nvcc)" $false "" `
             "CUDA Toolkit not found or nvcc not in PATH" `
-            "Download CUDA 12.8 from: https://developer.nvidia.com/cuda-12-8-0-download-archive"
+            "Download CUDA 13.0 or newer from: https://developer.nvidia.com/cuda-downloads"
     }
 
     # Check 5: Git
@@ -856,3 +856,4 @@ Build-LichtFeldStudio
 Write-Host ""
 Write-Host "All done!" -ForegroundColor Green
 Write-Host ""
+
