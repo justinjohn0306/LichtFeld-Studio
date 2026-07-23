@@ -22,7 +22,7 @@ LichtFeld-Studio One-Shot Build Script
 Usage: .\build_lichtfeld.ps1 [options]
 
 This script automatically:
-  1. Verifies build prerequisites (VS 2022, CUDA 12.8, CMake, Git)
+  1. Verifies build prerequisites (VS 2022, CUDA 13.0, CMake, Git)
   2. Sets up vcpkg in the parent directory
   3. Downloads LibTorch (Debug & Release) if missing
   4. Configures and builds LichtFeld-Studio
@@ -47,7 +47,9 @@ Examples:
 $ErrorActionPreference = 'Stop'
 $ScriptPath = $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptPath
-$VcpkgPath = Join-Path (Split-Path -Parent $ProjectRoot) "vcpkg"
+$ProjectVcpkgPath = Join-Path $ProjectRoot "vcpkg"
+$ParentVcpkgPath = Join-Path (Split-Path -Parent $ProjectRoot) "vcpkg"
+$VcpkgPath = if (Test-Path $ProjectVcpkgPath) { $ProjectVcpkgPath } else { $ParentVcpkgPath }
 
 # Track overall status
 $AllChecksPassed = $true
@@ -279,18 +281,19 @@ function Test-BuildEnvironment {
     }
 
     # Check 4: CUDA Toolkit
-    Write-Host "[4/7] Checking CUDA Toolkit 12.8..." -ForegroundColor Yellow
+    Write-Host "[4/7] Checking CUDA Toolkit 13.0 or newer..." -ForegroundColor Yellow
     if (Test-Command "nvcc") {
         try {
             $NvccOutput = nvcc --version 2>&1 | Select-String "release"
-            $CudaVersion = ($NvccOutput -split "release ")[1] -split "," | Select-Object -First 1
+            $CudaVersion = (($NvccOutput -split "release ")[1] -split "," | Select-Object -First 1).Trim()
+            $CudaVersionParsed = [version]$CudaVersion
 
-            if ($CudaVersion -match "12\.8") {
+            if ($CudaVersionParsed -ge [version]"13.0") {
                 Write-Status "CUDA Toolkit (nvcc)" $true "v$CudaVersion"
             } else {
                 Write-Status "CUDA Toolkit (nvcc)" $false "v$CudaVersion" `
-                    "CUDA 12.8 is required (found $CudaVersion)" `
-                    "Download CUDA 12.8 from: https://developer.nvidia.com/cuda-12-8-0-download-archive"
+                    "CUDA 13.0 or newer is required (found $CudaVersion)" `
+                    "Download CUDA 13.0 or newer from: https://developer.nvidia.com/cuda-downloads"
             }
         } catch {
             Write-Status "CUDA Toolkit (nvcc)" $true "Found (version check failed)"
@@ -298,7 +301,7 @@ function Test-BuildEnvironment {
     } else {
         Write-Status "CUDA Toolkit (nvcc)" $false "" `
             "CUDA Toolkit not found or nvcc not in PATH" `
-            "Download CUDA 12.8 from: https://developer.nvidia.com/cuda-12-8-0-download-archive"
+            "Download CUDA 13.0 or newer from: https://developer.nvidia.com/cuda-downloads"
     }
 
     # Check 5: Git
@@ -529,21 +532,6 @@ function Build-LichtFeldStudio {
             Write-Host "Expected: $VcpkgToolchain" -ForegroundColor Gray
             Write-Host ""
             Write-Host "Please run without -SkipVcpkg to set up vcpkg first." -ForegroundColor Yellow
-            exit 1
-        }
-
-        # Verify LibTorch exists for the selected configuration
-        $LibTorchPath = if ($Configuration -eq 'Debug') {
-            Join-Path $ProjectRoot "external\debug\libtorch"
-        } else {
-            Join-Path $ProjectRoot "external\release\libtorch"
-        }
-
-        if (-not (Test-Path $LibTorchPath)) {
-            Write-Host "ERROR: LibTorch ($Configuration) not found!" -ForegroundColor Red
-            Write-Host "Expected: $LibTorchPath" -ForegroundColor Gray
-            Write-Host ""
-            Write-Host "Please run without -SkipLibTorch to download LibTorch first." -ForegroundColor Yellow
             exit 1
         }
 
