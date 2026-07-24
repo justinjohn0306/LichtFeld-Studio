@@ -765,8 +765,15 @@ function Build-LichtFeldStudio {
         Write-Host "This may take 10-30 minutes depending on your system..." -ForegroundColor Gray
         Write-Host ""
 
-        # Use msbuild for better Windows compatibility
-        $SolutionFile = Join-Path $BuildDir "LichtFeld-Studio.sln"
+        # Use msbuild for better Windows compatibility. VS 18 emits .slnx.
+        $SolutionFile = Join-Path $BuildDir "LichtFeld-Studio.slnx"
+        if (-not (Test-Path $SolutionFile)) {
+            $SolutionFile = Join-Path $BuildDir "LichtFeld-Studio.sln"
+        }
+        if (-not (Test-Path $SolutionFile)) {
+            Write-Host "ERROR: Solution file not found (.slnx or .sln) in $BuildDir" -ForegroundColor Red
+            exit 1
+        }
         msbuild $SolutionFile /p:Configuration=$Configuration /p:Platform=x64 /m
 
         if ($LASTEXITCODE -ne 0) {
