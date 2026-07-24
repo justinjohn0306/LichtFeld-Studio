@@ -291,7 +291,8 @@ function Test-BuildEnvironment {
     if (Test-Command "nvcc") {
         try {
             $NvccOutput = nvcc --version 2>&1 | Select-String "release"
-            $CudaVersion = ($NvccOutput -split "release ")[1] -split "," | Select-Object -First 1
+            $CudaVersion = (($NvccOutput -split "release ")[1] -split "," | Select-Object -First 1).Trim()
+            $CudaVersionParsed = [version]$CudaVersion
 
             if ($CudaVersionParsed -ge [version]"13.0") {
                 Write-Status "CUDA Toolkit (nvcc)" $true "v$CudaVersion"
