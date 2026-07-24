@@ -696,18 +696,27 @@ function Build-LichtFeldStudio {
             Write-Host ""
         }
 
-        # Always use Visual Studio generator on Windows for better compatibility
-        $Generator = "Visual Studio 17 2022"
+        # Select the generator matching the active Visual Studio environment.
+        $VisualStudioMajor = if ($env:VisualStudioVersion) {
+            ([version]$env:VisualStudioVersion).Major
+        } else {
+            17
+        }
+        $Generator = if ($VisualStudioMajor -ge 18) {
+            "Visual Studio 18 2026"
+        } else {
+            "Visual Studio 17 2022"
+        }
 
         # Verify Visual Studio generator is available (only if cl.exe wasn't found earlier)
         # If we're in a VS dev environment with working cl.exe, the generator should work
         if (-not (Test-Command "cl")) {
             $VSInstallPath = Find-VSInstallPath
             if (-not $VSInstallPath) {
-                Write-Host "ERROR: Visual Studio 2022 not found!" -ForegroundColor Red
-                Write-Host "The '$Generator' generator requires Visual Studio 2022 to be installed." -ForegroundColor Gray
+                Write-Host "ERROR: Visual Studio with the C++ workload not found!" -ForegroundColor Red
+                Write-Host "The '$Generator' generator requires a compatible Visual Studio installation." -ForegroundColor Gray
                 Write-Host ""
-                Write-Host "Please install Visual Studio 2022 with 'Desktop development with C++' workload" -ForegroundColor Yellow
+                Write-Host "Please install Visual Studio with the 'Desktop development with C++' workload" -ForegroundColor Yellow
                 Write-Host "Download from: https://visualstudio.microsoft.com/downloads/" -ForegroundColor Cyan
                 exit 1
             }
