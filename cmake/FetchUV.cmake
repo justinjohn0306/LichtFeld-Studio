@@ -124,13 +124,23 @@ function(copy_uv_to_build)
     endif()
 
     set(_DEST_DIR "${CMAKE_BINARY_DIR}/bin")
-    if(EXISTS "${_DEST_DIR}/${UV_BINARY_NAME}")
-        return()
+    if(NOT EXISTS "${_DEST_DIR}/${UV_BINARY_NAME}")
+        file(MAKE_DIRECTORY "${_DEST_DIR}")
+        file(COPY "${UV_BINARY_PATH}" DESTINATION "${_DEST_DIR}")
+        message(STATUS "FetchUV: Copied uv to ${_DEST_DIR}/")
     endif()
 
-    file(MAKE_DIRECTORY "${_DEST_DIR}")
-    file(COPY "${UV_BINARY_PATH}" DESTINATION "${_DEST_DIR}")
-    message(STATUS "FetchUV: Copied uv to ${_DEST_DIR}/")
+    # Multi-config generators place the executable in build/<CONFIG>.
+    # PackageManager resolves uv relative to that executable, so stage a copy
+    # beside every configured runtime as well.
+    if(CMAKE_CONFIGURATION_TYPES)
+        foreach(_config IN LISTS CMAKE_CONFIGURATION_TYPES)
+            set(_CONFIG_DEST_DIR "${CMAKE_BINARY_DIR}/${_config}/bin")
+            file(MAKE_DIRECTORY "${_CONFIG_DEST_DIR}")
+            file(COPY "${UV_BINARY_PATH}" DESTINATION "${_CONFIG_DEST_DIR}")
+        endforeach()
+        message(STATUS "FetchUV: Copied uv to multi-config runtime directories")
+    endif()
 endfunction()
 
 # Function to install uv to the bin directory
