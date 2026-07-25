@@ -120,6 +120,7 @@ set(TEST_FILES
     test_mrnf_strategy.cpp
     test_sparsity_optimizer.cpp
     test_mcmc_tensor_ops.cpp
+    test_training_cropbox_mask.cpp
     test_tensor_index_select_uint8.cpp
     test_tensor_uint8_inversion.cpp
     test_tensor_uint8_masking.cpp
@@ -138,6 +139,8 @@ set(TEST_FILES
     test_densification_tensor_ops.cpp
     test_tensor_zero_dimension.cpp
     test_mask_loss.cpp
+    test_roi_weight_map.cpp
+    test_roi_weighted_losses.cpp
     test_checkpoint_resume.cpp
     test_atomic_output.cpp
     test_training_terminal_state.cpp
@@ -229,6 +232,7 @@ set(TEST_FILES
     test_colmap_binary_error_taxonomy.cpp
     test_splat_simplify.cpp
     test_rml_text_input_handler.cpp
+    test_rml_im_mode_layout.cpp
     test_rotated_sh_correctness.cpp
     test_tensor_stream.cpp
     test_tensor_d4_from_blob_stream.cpp
@@ -267,9 +271,11 @@ list(APPEND TEST_FILES test_rad_meta_sidecar.cpp)
 # instead of silently dropping coverage from the executable.
 set(TEST_SOURCES test_main.cpp ${TEST_FILES})
 
-# PyModalRegistry data layer (no ImGui) for lock-order regression tests.
+# PyModalRegistry and its native-modal dispatch path for regression tests.
 list(APPEND TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/python/lfs/py_modal_registry.cpp
+    ${CMAKE_SOURCE_DIR}/src/python/lfs/py_ui_modals.cpp
+    ${CMAKE_SOURCE_DIR}/src/python/lfs/rml_im_mode_layout.cpp
     ${CMAKE_SOURCE_DIR}/src/app/mcp_sequencer_tools.cpp
     ${CMAKE_SOURCE_DIR}/src/app/converter.cpp
 )
@@ -338,8 +344,6 @@ target_link_libraries(lichtfeld_tests PRIVATE
     # External libraries
     GTest::gtest
     nanobind-static
-    imgui::imgui
-    implot::implot
     ${TORCH_LIBRARIES}
     OpenImageIO::OpenImageIO
     OpenMeshCore
