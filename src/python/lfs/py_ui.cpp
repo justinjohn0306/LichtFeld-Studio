@@ -51,6 +51,7 @@
 #include "visualizer/training/training_manager.hpp"
 
 #include "config.h"
+#include "git_version.h"
 
 #include "visualizer/input/key_codes.hpp"
 
@@ -4834,6 +4835,9 @@ namespace lfs::python {
             "set_language",
             [](const std::string& lang_code) {
                 if (lfs::event::LocalizationManager::getInstance().setLanguage(lang_code)) {
+                    if (lang_code == "ja" || lang_code == "ko" || lang_code == "zh")
+                        if (auto* const gui_manager = get_gui_manager())
+                            gui_manager->ensureCjkFontsLoaded();
                     lfs::vis::publish_language_generation();
                 }
             },

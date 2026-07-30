@@ -44,6 +44,7 @@
 #include "gui/icon_cache.hpp"
 #include "input/frame_input_buffer.hpp"
 #include "input/input_controller.hpp"
+#include "input/input_router.hpp"
 #include "input/sdl_key_mapping.hpp"
 #include "internal/resource_paths.hpp"
 #include "tools/align_tool.hpp"
@@ -56,7 +57,6 @@
 #include "python/runner.hpp"
 #include "python/ui_hooks.hpp"
 #include "rendering/coordinate_conventions.hpp"
-#include "rendering/cuda_vulkan_interop.hpp"
 #include "rendering/image_layout.hpp"
 #include "rendering/passes/vulkan_viewport_pass.hpp"
 #include "rendering/rendering_manager.hpp"
@@ -98,38 +98,6 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
-
-namespace lfs::vis {
-    struct VulkanSceneInteropTarget {
-        VulkanContext::ExternalImage image;
-        VulkanContext::ExternalSemaphore semaphore;
-        lfs::rendering::CudaVulkanInterop interop;
-        glm::ivec2 size{0, 0};
-        VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
-        std::uint64_t timeline_value = 0;
-        std::uint64_t generation = 0;
-        // Generation of the source content (renderer-supplied) most recently
-        // copied into this slot's external image. Used to skip re-uploads when
-        // the renderer returns the same logical image (cache HIT) even though
-        // it allocated a fresh Tensor pointer.
-        std::uint64_t uploaded_source_generation = 0;
-
-        void destroy(VulkanContext& context) {
-            if (!context.waitForImmediateSubmits()) {
-                LOG_ERROR("Could not drain Vulkan interop transitions before target destruction: {}",
-                          context.lastError());
-            }
-            interop.reset();
-            context.destroyExternalSemaphore(semaphore);
-            context.destroyExternalImage(image);
-            size = {0, 0};
-            layout = VK_IMAGE_LAYOUT_UNDEFINED;
-            timeline_value = 0;
-            uploaded_source_generation = 0;
-            ++generation;
-        }
-    };
-} // namespace lfs::vis
 
 namespace lfs::vis::gui {
 
@@ -3227,10 +3195,6 @@ namespace lfs::vis::gui {
             throw std::runtime_error("Failed to initialize Vulkan UI context");
         }
         setVulkanUiTextureContext(vulkan_context);
-        if (!vulkan_interop_upload_stream_.init()) {
-            LOG_ERROR("Could not create the non-blocking CUDA/Vulkan GUI upload stream: {}",
-                      vulkan_interop_upload_stream_.lastError());
-        }
 
         // Initialize localization system
         auto& loc = lfs::event::LocalizationManager::getInstance();
@@ -3835,15 +3799,6 @@ namespace lfs::vis::gui {
         // static destruction happens after VulkanContext::shutdown().
         IconCache::instance().clear();
         setVulkanUiTextureContext(nullptr);
-        if (!vulkan_interop_upload_stream_.synchronize()) {
-            LOG_WARN("CUDA/Vulkan GUI upload stream synchronization failed during shutdown: {}",
-                     vulkan_interop_upload_stream_.lastError());
-        }
-        resetVulkanSceneInterop();
-        resetVulkanSplitRightInterop();
-        resetVulkanDepthBlitInterop();
-        vulkan_interop_upload_stream_.reset();
-        vulkan_scene_image_.reset();
         vulkan_viewport_pass_.reset();
         vulkan_gui_ = false;
     }
@@ -3932,832 +3887,6 @@ namespace lfs::vis::gui {
                   PanelSpace::ViewportOverlay, 0);
     }
 
-    void GuiManager::setVulkanSceneImage(std::shared_ptr<const lfs::core::Tensor> image,
-                                         const glm::ivec2 size,
-                                         const bool flip_y,
-                                         const std::uint64_t generation,
-                                         const VkSemaphore completion_semaphore,
-                                         const std::uint64_t completion_value) {
-        const bool target_changed =
-            vulkan_scene_image_.get() != image.get() ||
-            vulkan_scene_image_size_ != size;
-        if (target_changed) {
-            vulkan_scene_interop_disabled_ = false;
-        }
-        vulkan_external_scene_image_ = VK_NULL_HANDLE;
-        vulkan_external_scene_image_view_ = VK_NULL_HANDLE;
-        vulkan_external_scene_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-        vulkan_external_scene_image_size_ = {0, 0};
-        vulkan_frame_completion_semaphore_ = completion_semaphore;
-        vulkan_frame_completion_value_ = completion_value;
-        vulkan_scene_image_ = std::move(image);
-        vulkan_scene_image_generation_ = generation;
-        vulkan_scene_image_size_ = size;
-        vulkan_scene_image_flip_y_ = flip_y;
-    }
-
-    void GuiManager::setVulkanExternalSceneImage(const VkImage image,
-                                                 const VkImageView image_view,
-                                                 const VkImageLayout layout,
-                                                 const glm::ivec2 size,
-                                                 const bool flip_y,
-                                                 const std::uint64_t generation,
-                                                 const VkSemaphore completion_semaphore,
-                                                 const std::uint64_t completion_value) {
-        vulkan_scene_image_.reset();
-        vulkan_scene_image_size_ = size;
-        vulkan_scene_image_flip_y_ = flip_y;
-        vulkan_external_scene_image_ = image;
-        vulkan_external_scene_image_view_ = image_view;
-        vulkan_external_scene_image_layout_ = layout;
-        vulkan_external_scene_image_size_ = size;
-        vulkan_external_scene_image_flip_y_ = flip_y;
-        vulkan_external_scene_image_generation_ = generation;
-        vulkan_frame_completion_semaphore_ = completion_semaphore;
-        vulkan_frame_completion_value_ = completion_value;
-    }
-
-    void GuiManager::setVulkanSplitRightImage(std::shared_ptr<const lfs::core::Tensor> image,
-                                              const glm::ivec2 size,
-                                              const bool flip_y,
-                                              const std::uint64_t generation) {
-        const bool target_changed =
-            vulkan_split_right_image_.get() != image.get() ||
-            vulkan_split_right_image_size_ != size;
-        if (target_changed) {
-            vulkan_split_right_interop_disabled_ = false;
-        }
-        vulkan_split_right_image_ = std::move(image);
-        vulkan_split_right_image_generation_ = generation;
-        vulkan_split_right_image_size_ = size;
-        vulkan_split_right_image_flip_y_ = flip_y;
-    }
-
-    void GuiManager::clearVulkanSplitRightImage() {
-        vulkan_split_right_image_.reset();
-        vulkan_split_right_image_size_ = {0, 0};
-        vulkan_split_right_image_flip_y_ = false;
-        vulkan_split_right_image_generation_ = 0;
-        vulkan_split_right_external_image_ = VK_NULL_HANDLE;
-        vulkan_split_right_external_image_view_ = VK_NULL_HANDLE;
-        vulkan_split_right_external_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-        vulkan_split_right_external_image_generation_ = 0;
-    }
-
-    void GuiManager::setVulkanDepthBlitImage(std::shared_ptr<const lfs::core::Tensor> depth,
-                                             const glm::ivec2 size,
-                                             const std::uint64_t generation) {
-        const bool target_changed =
-            vulkan_depth_blit_image_.get() != depth.get() ||
-            vulkan_depth_blit_image_size_ != size;
-        if (target_changed) {
-            vulkan_depth_blit_interop_disabled_ = false;
-        }
-        vulkan_depth_blit_image_ = std::move(depth);
-        vulkan_depth_blit_image_generation_ = generation;
-        vulkan_depth_blit_image_size_ = size;
-    }
-
-    void GuiManager::clearVulkanDepthBlitImage() {
-        vulkan_depth_blit_image_.reset();
-        vulkan_depth_blit_image_size_ = {0, 0};
-        vulkan_depth_blit_image_generation_ = 0;
-        vulkan_depth_blit_external_image_ = VK_NULL_HANDLE;
-        vulkan_depth_blit_external_image_view_ = VK_NULL_HANDLE;
-        vulkan_depth_blit_external_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-        vulkan_depth_blit_external_image_generation_ = 0;
-    }
-
-    void GuiManager::resetVulkanSceneInterop() {
-        if (vulkan_scene_interop_.empty()) {
-            return;
-        }
-        auto* const window_manager = viewer_ ? viewer_->getWindowManager() : nullptr;
-        auto* const vulkan_context = window_manager ? window_manager->getVulkanContext() : nullptr;
-        // A previous frame's submit may still sample one of these slots; drain
-        // before vkDestroyImage to avoid VK_ERROR_DEVICE_LOST.
-        if (vulkan_context) {
-            (void)vulkan_context->waitForSubmittedFrames();
-        }
-        for (auto& target : vulkan_scene_interop_) {
-            if (!target) {
-                continue;
-            }
-            if (vulkan_context) {
-                target->destroy(*vulkan_context);
-            } else {
-                target->interop.reset();
-            }
-        }
-        vulkan_scene_interop_.clear();
-    }
-
-    bool GuiManager::shouldDeferVulkanInteropResize() const {
-        auto* const rendering = viewer_ ? viewer_->getRenderingManager() : nullptr;
-        return rendering && rendering->isViewportResizeDeferring();
-    }
-
-    void GuiManager::prepareVulkanSceneInterop(VulkanContext& context) {
-        if (vulkan_scene_interop_disabled_) {
-            return;
-        }
-        if (vulkan_external_scene_image_ != VK_NULL_HANDLE) {
-            return;
-        }
-
-        const auto fail_required_interop = [this](std::string message) -> void {
-            vulkan_scene_interop_disabled_ = true;
-            if (!vulkan_interop_upload_stream_.synchronize()) {
-                message += std::format("; CUDA upload drain failed: {}",
-                                       vulkan_interop_upload_stream_.lastError());
-            }
-            resetVulkanSceneInterop();
-            LOG_ERROR("Required Vulkan/CUDA viewport interop failed: {}", message);
-            throw std::runtime_error(std::move(message));
-        };
-
-        if (!vulkan_scene_image_ ||
-            !vulkan_scene_image_->is_valid() ||
-            vulkan_scene_image_->device() != lfs::core::Device::CUDA ||
-            vulkan_scene_image_size_.x <= 0 ||
-            vulkan_scene_image_size_.y <= 0) {
-            if (!vulkan_scene_interop_.empty()) {
-                resetVulkanSceneInterop();
-            }
-            return;
-        }
-        if (!vulkan_interop_upload_stream_.valid()) {
-            fail_required_interop("non-blocking CUDA upload stream is unavailable");
-        }
-
-        const std::size_t frame_slot = context.currentFrameSlot();
-        const bool slot_array_resize_needed = vulkan_scene_interop_.size() != context.framesInFlight();
-        const bool resize_deferring = shouldDeferVulkanInteropResize();
-
-        // Cache-HIT fast path: when nothing about the source image changed since the last
-        // upload into THIS slot's interop target, there's no work to do — and crucially no
-        // need to vkWaitForFences this slot. The previous unconditional wait was costing
-        // ~kFrameDuration ms per frame (10–12 ms with kFramesInFlight=1) for no reason on
-        // every renderer cache-HIT frame, which dominated gui_render time.
-        if (!slot_array_resize_needed && frame_slot < vulkan_scene_interop_.size()) {
-            const auto& target_ptr_const = vulkan_scene_interop_[frame_slot];
-            const glm::ivec2 target_size = vulkan_scene_image_size_;
-            const bool recreate_needed =
-                !target_ptr_const ||
-                target_ptr_const->size != target_size ||
-                !target_ptr_const->interop.valid();
-            if (!recreate_needed &&
-                vulkan_scene_image_generation_ != 0 &&
-                target_ptr_const->uploaded_source_generation == vulkan_scene_image_generation_ &&
-                target_ptr_const->layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
-                LOG_PERF("interop slot={} cache-HIT-skip cur_gen={} layout={}",
-                         frame_slot, vulkan_scene_image_generation_,
-                         static_cast<int>(target_ptr_const->layout));
-                return;
-            }
-            if (resize_deferring && recreate_needed) {
-                return;
-            }
-        } else if (resize_deferring) {
-            return;
-        }
-
-        // Slow path: we will write to the interop image (recreate, transition, or copy).
-        // Wait for any in-flight GPU use of this slot to finish before we touch it.
-        {
-            LOG_TIMER("interop.waitForCurrentFrameSlot");
-            if (!context.waitForCurrentFrameSlot()) {
-                fail_required_interop(std::format("frame slot wait failed: {}", context.lastError()));
-            }
-        }
-
-        if (slot_array_resize_needed) {
-            resetVulkanSceneInterop();
-            vulkan_scene_interop_.resize(context.framesInFlight());
-        }
-        if (frame_slot >= vulkan_scene_interop_.size()) {
-            fail_required_interop(std::format("invalid frame slot {}", frame_slot));
-        }
-        auto& target_ptr = vulkan_scene_interop_[frame_slot];
-        const auto reset_frame_target = [&]() {
-            if (target_ptr) {
-                target_ptr->destroy(context);
-                target_ptr.reset();
-            }
-        };
-
-        const glm::ivec2 target_size = vulkan_scene_image_size_;
-        const bool recreate =
-            !target_ptr ||
-            target_ptr->size != target_size ||
-            !target_ptr->interop.valid();
-        LOG_PERF("interop slot={} recreate={} cur_gen={} uploaded_gen={} layout={}",
-                 frame_slot, recreate,
-                 vulkan_scene_image_generation_,
-                 target_ptr ? target_ptr->uploaded_source_generation : 0,
-                 target_ptr ? static_cast<int>(target_ptr->layout) : -1);
-        if (recreate) {
-            reset_frame_target();
-            auto target = std::make_unique<VulkanSceneInteropTarget>();
-            const VkExtent2D extent{
-                static_cast<std::uint32_t>(target_size.x),
-                static_cast<std::uint32_t>(target_size.y),
-            };
-            if (!context.createExternalImage(extent,
-                                             VK_FORMAT_R8G8B8A8_UNORM,
-                                             target->image,
-                                             "vulkan.gui.interop_image",
-                                             std::format("scene.frame{}", frame_slot)) ||
-                !context.createExternalTimelineSemaphore(0, target->semaphore)) {
-                const std::string error = std::format("target creation failed: {}", context.lastError());
-                if (target->image.image != VK_NULL_HANDLE || target->semaphore.semaphore != VK_NULL_HANDLE) {
-                    target->destroy(context);
-                }
-                fail_required_interop(error);
-            }
-            const std::uint64_t vulkan_ready_value = ++target->timeline_value;
-            if (!context.transitionImageLayoutImmediate(target->image.image,
-                                                        VK_IMAGE_LAYOUT_UNDEFINED,
-                                                        VK_IMAGE_LAYOUT_GENERAL,
-                                                        VulkanContext::ImmediateTransitionOptions::signalAt(
-                                                            {target->semaphore.semaphore, vulkan_ready_value}))) {
-                const std::string error = std::format("image initialization failed: {}", context.lastError());
-                target->destroy(context);
-                fail_required_interop(error);
-            }
-            // Complete the one-time Vulkan initialization before exporting the
-            // timeline to CUDA. Later handoffs remain asynchronous, but no
-            // external producer may advance this semaphore past the pending
-            // Vulkan signal that establishes its initial image ownership.
-            if (!context.waitForImmediateSubmits()) {
-                const std::string error = std::format(
-                    "image initialization handoff failed: {}", context.lastError());
-                target->destroy(context);
-                fail_required_interop(error);
-            }
-
-            const auto memory_handle = context.releaseExternalImageNativeHandle(target->image);
-            const auto semaphore_handle = context.releaseExternalSemaphoreNativeHandle(target->semaphore);
-            lfs::rendering::CudaVulkanExternalImageImport image_import{
-                .memory_handle = memory_handle,
-                .allocation_size = static_cast<std::size_t>(target->image.allocation_size),
-                .extent = {.width = extent.width, .height = extent.height},
-                .format = lfs::rendering::CudaVulkanImageFormat::Rgba8Unorm,
-                .dedicated_allocation = context.externalMemoryDedicatedAllocationEnabled(),
-            };
-            lfs::rendering::CudaVulkanExternalSemaphoreImport semaphore_import{
-                .semaphore_handle = semaphore_handle,
-                .initial_value = 0,
-            };
-            if (!target->interop.init(image_import, semaphore_import)) {
-                const std::string error = std::format("CUDA import failed: {}", target->interop.lastError());
-                target->destroy(context);
-                fail_required_interop(error);
-            }
-            target->size = target_size;
-            target->layout = VK_IMAGE_LAYOUT_GENERAL;
-            target_ptr = std::move(target);
-            LOG_INFO("Vulkan/CUDA viewport interop target initialized for frame slot {}: {}x{}",
-                     frame_slot,
-                     target_size.x,
-                     target_size.y);
-        }
-
-        auto& target = *target_ptr;
-        // Skip the upload (and the queue-blocking layout transitions inside it)
-        // when this slot already holds the same content. Renderer cache-HIT
-        // frames keep image_generation stable while alternating tensor pointers,
-        // so identity-by-pointer is unsafe — use the source generation.
-        if (vulkan_scene_image_generation_ != 0 &&
-            target.uploaded_source_generation == vulkan_scene_image_generation_ &&
-            target.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
-            return;
-        }
-
-        if (target.layout != VK_IMAGE_LAYOUT_GENERAL) {
-            LOG_TIMER("interop.transition_to_GENERAL");
-            const std::uint64_t vulkan_ready_value = ++target.timeline_value;
-            if (!context.transitionImageLayoutImmediate(target.image.image,
-                                                        target.layout,
-                                                        VK_IMAGE_LAYOUT_GENERAL,
-                                                        VulkanContext::ImmediateTransitionOptions::signalAt(
-                                                            {target.semaphore.semaphore, vulkan_ready_value}))) {
-                fail_required_interop(std::format("image transition to GENERAL failed: {}", context.lastError()));
-            }
-            target.layout = VK_IMAGE_LAYOUT_GENERAL;
-        }
-
-        {
-            LOG_TIMER("interop.copyTensorToSurface");
-            assert(target.layout == VK_IMAGE_LAYOUT_GENERAL &&
-                   "CUDA surf2Dwrite requires VK_IMAGE_LAYOUT_GENERAL");
-            if (!target.interop.wait(target.timeline_value,
-                                     vulkan_interop_upload_stream_.stream())) {
-                fail_required_interop(std::format("CUDA wait for Vulkan image release failed: {}",
-                                                  target.interop.lastError()));
-            }
-            if (!target.interop.copyTensorToSurface(*vulkan_scene_image_,
-                                                    vulkan_interop_upload_stream_.stream())) {
-                fail_required_interop(std::format("CUDA copy failed: {}", target.interop.lastError()));
-            }
-        }
-        const std::uint64_t signal_value = ++target.timeline_value;
-        {
-            LOG_TIMER("interop.cuda_signal");
-            if (!target.interop.signal(signal_value, vulkan_interop_upload_stream_.stream())) {
-                fail_required_interop(std::format("CUDA signal failed: {}", target.interop.lastError()));
-            }
-        }
-        {
-            LOG_TIMER("interop.transition_to_READ_ONLY");
-            if (!context.transitionImageLayoutImmediate(target.image.image,
-                                                        VK_IMAGE_LAYOUT_GENERAL,
-                                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                                        VulkanContext::ImmediateTransitionOptions::waitOn(
-                                                            {target.semaphore.semaphore, signal_value},
-                                                            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT))) {
-                fail_required_interop(std::format("Vulkan wait for CUDA signal failed: {}", context.lastError()));
-            }
-        }
-        target.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        target.uploaded_source_generation = vulkan_scene_image_generation_;
-        ++target.generation;
-    }
-
-    void GuiManager::resetVulkanSplitRightInterop() {
-        vulkan_split_right_external_image_ = VK_NULL_HANDLE;
-        vulkan_split_right_external_image_view_ = VK_NULL_HANDLE;
-        vulkan_split_right_external_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-        vulkan_split_right_external_image_generation_ = 0;
-        if (vulkan_split_right_interop_.empty()) {
-            return;
-        }
-        auto* const window_manager = viewer_ ? viewer_->getWindowManager() : nullptr;
-        auto* const vulkan_context = window_manager ? window_manager->getVulkanContext() : nullptr;
-        if (vulkan_context) {
-            (void)vulkan_context->waitForSubmittedFrames();
-        }
-        for (auto& target : vulkan_split_right_interop_) {
-            if (!target) {
-                continue;
-            }
-            if (vulkan_context) {
-                target->destroy(*vulkan_context);
-            } else {
-                target->interop.reset();
-            }
-        }
-        vulkan_split_right_interop_.clear();
-    }
-
-    void GuiManager::prepareVulkanSplitRightInterop(VulkanContext& context) {
-        if (vulkan_split_right_interop_disabled_) {
-            return;
-        }
-
-        const auto fail_required_interop = [this](std::string message) -> void {
-            vulkan_split_right_interop_disabled_ = true;
-            if (!vulkan_interop_upload_stream_.synchronize()) {
-                message += std::format("; CUDA upload drain failed: {}",
-                                       vulkan_interop_upload_stream_.lastError());
-            }
-            resetVulkanSplitRightInterop();
-            LOG_ERROR("Required Vulkan/CUDA split-view interop failed: {}", message);
-            throw std::runtime_error(std::move(message));
-        };
-
-        if (!vulkan_split_right_image_ ||
-            !vulkan_split_right_image_->is_valid() ||
-            vulkan_split_right_image_->device() != lfs::core::Device::CUDA ||
-            vulkan_split_right_image_size_.x <= 0 ||
-            vulkan_split_right_image_size_.y <= 0) {
-            if (!vulkan_split_right_interop_.empty()) {
-                resetVulkanSplitRightInterop();
-            }
-            vulkan_split_right_external_image_ = VK_NULL_HANDLE;
-            vulkan_split_right_external_image_view_ = VK_NULL_HANDLE;
-            vulkan_split_right_external_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-            vulkan_split_right_external_image_generation_ = 0;
-            return;
-        }
-        if (!vulkan_interop_upload_stream_.valid()) {
-            fail_required_interop("non-blocking CUDA upload stream is unavailable");
-        }
-
-        const std::size_t frame_slot = context.currentFrameSlot();
-        const bool slot_array_resize_needed =
-            vulkan_split_right_interop_.size() != context.framesInFlight();
-        const auto clear_external_split_right = [this]() {
-            vulkan_split_right_external_image_ = VK_NULL_HANDLE;
-            vulkan_split_right_external_image_view_ = VK_NULL_HANDLE;
-            vulkan_split_right_external_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-            vulkan_split_right_external_image_generation_ = 0;
-        };
-        const bool resize_deferring = shouldDeferVulkanInteropResize();
-
-        if (!slot_array_resize_needed && frame_slot < vulkan_split_right_interop_.size()) {
-            const auto& target_ptr_const = vulkan_split_right_interop_[frame_slot];
-            const glm::ivec2 target_size = vulkan_split_right_image_size_;
-            const bool recreate_needed =
-                !target_ptr_const ||
-                target_ptr_const->size != target_size ||
-                !target_ptr_const->interop.valid();
-            if (!recreate_needed &&
-                vulkan_split_right_image_generation_ != 0 &&
-                target_ptr_const->uploaded_source_generation == vulkan_split_right_image_generation_ &&
-                target_ptr_const->layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
-                vulkan_split_right_external_image_ = target_ptr_const->image.image;
-                vulkan_split_right_external_image_view_ = target_ptr_const->image.view;
-                vulkan_split_right_external_image_layout_ = target_ptr_const->layout;
-                vulkan_split_right_external_image_generation_ = target_ptr_const->generation;
-                return;
-            }
-            if (resize_deferring && recreate_needed) {
-                clear_external_split_right();
-                return;
-            }
-        } else if (resize_deferring) {
-            clear_external_split_right();
-            return;
-        }
-
-        if (!context.waitForCurrentFrameSlot()) {
-            fail_required_interop(std::format("frame slot wait failed: {}", context.lastError()));
-        }
-
-        if (slot_array_resize_needed) {
-            resetVulkanSplitRightInterop();
-            vulkan_split_right_interop_.resize(context.framesInFlight());
-        }
-        if (frame_slot >= vulkan_split_right_interop_.size()) {
-            fail_required_interop(std::format("invalid frame slot {}", frame_slot));
-        }
-        auto& target_ptr = vulkan_split_right_interop_[frame_slot];
-        const auto reset_frame_target = [&]() {
-            if (target_ptr) {
-                target_ptr->destroy(context);
-                target_ptr.reset();
-            }
-        };
-
-        const glm::ivec2 target_size = vulkan_split_right_image_size_;
-        const bool recreate =
-            !target_ptr ||
-            target_ptr->size != target_size ||
-            !target_ptr->interop.valid();
-        if (recreate) {
-            reset_frame_target();
-            auto target = std::make_unique<VulkanSceneInteropTarget>();
-            const VkExtent2D extent{
-                static_cast<std::uint32_t>(target_size.x),
-                static_cast<std::uint32_t>(target_size.y),
-            };
-            if (!context.createExternalImage(extent,
-                                             VK_FORMAT_R8G8B8A8_UNORM,
-                                             target->image,
-                                             "vulkan.gui.interop_image",
-                                             std::format("split_right.frame{}", frame_slot)) ||
-                !context.createExternalTimelineSemaphore(0, target->semaphore)) {
-                const std::string error = std::format("target creation failed: {}", context.lastError());
-                if (target->image.image != VK_NULL_HANDLE || target->semaphore.semaphore != VK_NULL_HANDLE) {
-                    target->destroy(context);
-                }
-                fail_required_interop(error);
-            }
-            const std::uint64_t vulkan_ready_value = ++target->timeline_value;
-            if (!context.transitionImageLayoutImmediate(target->image.image,
-                                                        VK_IMAGE_LAYOUT_UNDEFINED,
-                                                        VK_IMAGE_LAYOUT_GENERAL,
-                                                        VulkanContext::ImmediateTransitionOptions::signalAt(
-                                                            {target->semaphore.semaphore, vulkan_ready_value}))) {
-                const std::string error = std::format("image initialization failed: {}", context.lastError());
-                target->destroy(context);
-                fail_required_interop(error);
-            }
-            if (!context.waitForImmediateSubmits()) {
-                const std::string error = std::format(
-                    "image initialization handoff failed: {}", context.lastError());
-                target->destroy(context);
-                fail_required_interop(error);
-            }
-
-            const auto memory_handle = context.releaseExternalImageNativeHandle(target->image);
-            const auto semaphore_handle = context.releaseExternalSemaphoreNativeHandle(target->semaphore);
-            lfs::rendering::CudaVulkanExternalImageImport image_import{
-                .memory_handle = memory_handle,
-                .allocation_size = static_cast<std::size_t>(target->image.allocation_size),
-                .extent = {.width = extent.width, .height = extent.height},
-                .format = lfs::rendering::CudaVulkanImageFormat::Rgba8Unorm,
-                .dedicated_allocation = context.externalMemoryDedicatedAllocationEnabled(),
-            };
-            lfs::rendering::CudaVulkanExternalSemaphoreImport semaphore_import{
-                .semaphore_handle = semaphore_handle,
-                .initial_value = 0,
-            };
-            if (!target->interop.init(image_import, semaphore_import)) {
-                const std::string error = std::format("CUDA import failed: {}", target->interop.lastError());
-                target->destroy(context);
-                fail_required_interop(error);
-            }
-            target->size = target_size;
-            target->layout = VK_IMAGE_LAYOUT_GENERAL;
-            target_ptr = std::move(target);
-            LOG_INFO("Vulkan/CUDA split-view right-panel interop initialized for slot {}: {}x{}",
-                     frame_slot, target_size.x, target_size.y);
-        }
-
-        auto& target = *target_ptr;
-        if (vulkan_split_right_image_generation_ != 0 &&
-            target.uploaded_source_generation == vulkan_split_right_image_generation_ &&
-            target.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
-            vulkan_split_right_external_image_ = target.image.image;
-            vulkan_split_right_external_image_view_ = target.image.view;
-            vulkan_split_right_external_image_layout_ = target.layout;
-            vulkan_split_right_external_image_generation_ = target.generation;
-            return;
-        }
-
-        if (target.layout != VK_IMAGE_LAYOUT_GENERAL) {
-            const std::uint64_t vulkan_ready_value = ++target.timeline_value;
-            if (!context.transitionImageLayoutImmediate(target.image.image,
-                                                        target.layout,
-                                                        VK_IMAGE_LAYOUT_GENERAL,
-                                                        VulkanContext::ImmediateTransitionOptions::signalAt(
-                                                            {target.semaphore.semaphore, vulkan_ready_value}))) {
-                fail_required_interop(std::format("image transition to GENERAL failed: {}", context.lastError()));
-            }
-            target.layout = VK_IMAGE_LAYOUT_GENERAL;
-        }
-
-        assert(target.layout == VK_IMAGE_LAYOUT_GENERAL &&
-               "CUDA surf2Dwrite requires VK_IMAGE_LAYOUT_GENERAL");
-        if (!target.interop.wait(target.timeline_value,
-                                 vulkan_interop_upload_stream_.stream())) {
-            fail_required_interop(std::format("CUDA wait for Vulkan image release failed: {}",
-                                              target.interop.lastError()));
-        }
-        if (!target.interop.copyTensorToSurface(*vulkan_split_right_image_,
-                                                vulkan_interop_upload_stream_.stream())) {
-            fail_required_interop(std::format("CUDA copy failed: {}", target.interop.lastError()));
-        }
-        const std::uint64_t signal_value = ++target.timeline_value;
-        if (!target.interop.signal(signal_value, vulkan_interop_upload_stream_.stream())) {
-            fail_required_interop(std::format("CUDA signal failed: {}", target.interop.lastError()));
-        }
-        if (!context.transitionImageLayoutImmediate(target.image.image,
-                                                    VK_IMAGE_LAYOUT_GENERAL,
-                                                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                                    VulkanContext::ImmediateTransitionOptions::waitOn(
-                                                        {target.semaphore.semaphore, signal_value},
-                                                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT))) {
-            fail_required_interop(std::format("Vulkan wait for CUDA signal failed: {}", context.lastError()));
-        }
-        target.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        target.uploaded_source_generation = vulkan_split_right_image_generation_;
-        ++target.generation;
-        vulkan_split_right_external_image_ = target.image.image;
-        vulkan_split_right_external_image_view_ = target.image.view;
-        vulkan_split_right_external_image_layout_ = target.layout;
-        vulkan_split_right_external_image_generation_ = target.generation;
-    }
-
-    void GuiManager::resetVulkanDepthBlitInterop() {
-        vulkan_depth_blit_external_image_ = VK_NULL_HANDLE;
-        vulkan_depth_blit_external_image_view_ = VK_NULL_HANDLE;
-        vulkan_depth_blit_external_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-        vulkan_depth_blit_external_image_generation_ = 0;
-        if (vulkan_depth_blit_interop_.empty()) {
-            return;
-        }
-        auto* const window_manager = viewer_ ? viewer_->getWindowManager() : nullptr;
-        auto* const vulkan_context = window_manager ? window_manager->getVulkanContext() : nullptr;
-        if (vulkan_context) {
-            (void)vulkan_context->waitForSubmittedFrames();
-        }
-        for (auto& target : vulkan_depth_blit_interop_) {
-            if (!target) {
-                continue;
-            }
-            if (vulkan_context) {
-                target->destroy(*vulkan_context);
-            } else {
-                target->interop.reset();
-            }
-        }
-        vulkan_depth_blit_interop_.clear();
-    }
-
-    void GuiManager::prepareVulkanDepthBlitInterop(VulkanContext& context) {
-        if (vulkan_depth_blit_interop_disabled_) {
-            return;
-        }
-
-        const auto fail_required_interop = [this](std::string message) -> void {
-            vulkan_depth_blit_interop_disabled_ = true;
-            if (!vulkan_interop_upload_stream_.synchronize()) {
-                message += std::format("; CUDA upload drain failed: {}",
-                                       vulkan_interop_upload_stream_.lastError());
-            }
-            resetVulkanDepthBlitInterop();
-            LOG_ERROR("Required Vulkan/CUDA depth-blit interop failed: {}", message);
-            throw std::runtime_error(std::move(message));
-        };
-
-        if (!vulkan_depth_blit_image_ ||
-            !vulkan_depth_blit_image_->is_valid() ||
-            vulkan_depth_blit_image_->device() != lfs::core::Device::CUDA ||
-            vulkan_depth_blit_image_size_.x <= 0 ||
-            vulkan_depth_blit_image_size_.y <= 0) {
-            if (!vulkan_depth_blit_interop_.empty()) {
-                resetVulkanDepthBlitInterop();
-            }
-            vulkan_depth_blit_external_image_ = VK_NULL_HANDLE;
-            vulkan_depth_blit_external_image_view_ = VK_NULL_HANDLE;
-            vulkan_depth_blit_external_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-            vulkan_depth_blit_external_image_generation_ = 0;
-            return;
-        }
-        if (!vulkan_interop_upload_stream_.valid()) {
-            fail_required_interop("non-blocking CUDA upload stream is unavailable");
-        }
-
-        const std::size_t frame_slot = context.currentFrameSlot();
-        const bool slot_array_resize_needed =
-            vulkan_depth_blit_interop_.size() != context.framesInFlight();
-        const auto clear_external_depth_blit = [this]() {
-            vulkan_depth_blit_external_image_ = VK_NULL_HANDLE;
-            vulkan_depth_blit_external_image_view_ = VK_NULL_HANDLE;
-            vulkan_depth_blit_external_image_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-            vulkan_depth_blit_external_image_generation_ = 0;
-        };
-        const bool resize_deferring = shouldDeferVulkanInteropResize();
-
-        if (!slot_array_resize_needed && frame_slot < vulkan_depth_blit_interop_.size()) {
-            const auto& target_ptr_const = vulkan_depth_blit_interop_[frame_slot];
-            const glm::ivec2 target_size = vulkan_depth_blit_image_size_;
-            const bool recreate_needed =
-                !target_ptr_const ||
-                target_ptr_const->size != target_size ||
-                !target_ptr_const->interop.valid();
-            if (!recreate_needed &&
-                vulkan_depth_blit_image_generation_ != 0 &&
-                target_ptr_const->uploaded_source_generation == vulkan_depth_blit_image_generation_ &&
-                target_ptr_const->layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
-                vulkan_depth_blit_external_image_ = target_ptr_const->image.image;
-                vulkan_depth_blit_external_image_view_ = target_ptr_const->image.view;
-                vulkan_depth_blit_external_image_layout_ = target_ptr_const->layout;
-                vulkan_depth_blit_external_image_generation_ = target_ptr_const->generation;
-                return;
-            }
-            if (resize_deferring && recreate_needed) {
-                clear_external_depth_blit();
-                return;
-            }
-        } else if (resize_deferring) {
-            clear_external_depth_blit();
-            return;
-        }
-
-        if (!context.waitForCurrentFrameSlot()) {
-            fail_required_interop(std::format("frame slot wait failed: {}", context.lastError()));
-        }
-
-        if (slot_array_resize_needed) {
-            resetVulkanDepthBlitInterop();
-            vulkan_depth_blit_interop_.resize(context.framesInFlight());
-        }
-        if (frame_slot >= vulkan_depth_blit_interop_.size()) {
-            fail_required_interop(std::format("invalid frame slot {}", frame_slot));
-        }
-        auto& target_ptr = vulkan_depth_blit_interop_[frame_slot];
-        const auto reset_frame_target = [&]() {
-            if (target_ptr) {
-                target_ptr->destroy(context);
-                target_ptr.reset();
-            }
-        };
-
-        const glm::ivec2 target_size = vulkan_depth_blit_image_size_;
-        const bool recreate =
-            !target_ptr ||
-            target_ptr->size != target_size ||
-            !target_ptr->interop.valid();
-        if (recreate) {
-            reset_frame_target();
-            auto target = std::make_unique<VulkanSceneInteropTarget>();
-            const VkExtent2D extent{
-                static_cast<std::uint32_t>(target_size.x),
-                static_cast<std::uint32_t>(target_size.y),
-            };
-            if (!context.createExternalImage(extent,
-                                             VK_FORMAT_R32_SFLOAT,
-                                             target->image,
-                                             "vulkan.gui.interop_image",
-                                             std::format("depth_blit.frame{}", frame_slot)) ||
-                !context.createExternalTimelineSemaphore(0, target->semaphore)) {
-                const std::string error = std::format("target creation failed: {}", context.lastError());
-                if (target->image.image != VK_NULL_HANDLE || target->semaphore.semaphore != VK_NULL_HANDLE) {
-                    target->destroy(context);
-                }
-                fail_required_interop(error);
-            }
-            const std::uint64_t vulkan_ready_value = ++target->timeline_value;
-            if (!context.transitionImageLayoutImmediate(target->image.image,
-                                                        VK_IMAGE_LAYOUT_UNDEFINED,
-                                                        VK_IMAGE_LAYOUT_GENERAL,
-                                                        VulkanContext::ImmediateTransitionOptions::signalAt(
-                                                            {target->semaphore.semaphore, vulkan_ready_value}))) {
-                const std::string error = std::format("image initialization failed: {}", context.lastError());
-                target->destroy(context);
-                fail_required_interop(error);
-            }
-            if (!context.waitForImmediateSubmits()) {
-                const std::string error = std::format(
-                    "image initialization handoff failed: {}", context.lastError());
-                target->destroy(context);
-                fail_required_interop(error);
-            }
-
-            const auto memory_handle = context.releaseExternalImageNativeHandle(target->image);
-            const auto semaphore_handle = context.releaseExternalSemaphoreNativeHandle(target->semaphore);
-            lfs::rendering::CudaVulkanExternalImageImport image_import{
-                .memory_handle = memory_handle,
-                .allocation_size = static_cast<std::size_t>(target->image.allocation_size),
-                .extent = {.width = extent.width, .height = extent.height},
-                .format = lfs::rendering::CudaVulkanImageFormat::R32Sfloat,
-                .dedicated_allocation = context.externalMemoryDedicatedAllocationEnabled(),
-            };
-            lfs::rendering::CudaVulkanExternalSemaphoreImport semaphore_import{
-                .semaphore_handle = semaphore_handle,
-                .initial_value = 0,
-            };
-            if (!target->interop.init(image_import, semaphore_import)) {
-                const std::string error = std::format("CUDA import failed: {}", target->interop.lastError());
-                target->destroy(context);
-                fail_required_interop(error);
-            }
-            target->size = target_size;
-            target->layout = VK_IMAGE_LAYOUT_GENERAL;
-            target_ptr = std::move(target);
-            LOG_INFO("Vulkan/CUDA depth-blit interop initialized for slot {}: {}x{}",
-                     frame_slot, target_size.x, target_size.y);
-        }
-
-        auto& target = *target_ptr;
-        if (vulkan_depth_blit_image_generation_ != 0 &&
-            target.uploaded_source_generation == vulkan_depth_blit_image_generation_ &&
-            target.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
-            vulkan_depth_blit_external_image_ = target.image.image;
-            vulkan_depth_blit_external_image_view_ = target.image.view;
-            vulkan_depth_blit_external_image_layout_ = target.layout;
-            vulkan_depth_blit_external_image_generation_ = target.generation;
-            return;
-        }
-
-        if (target.layout != VK_IMAGE_LAYOUT_GENERAL) {
-            const std::uint64_t vulkan_ready_value = ++target.timeline_value;
-            if (!context.transitionImageLayoutImmediate(target.image.image,
-                                                        target.layout,
-                                                        VK_IMAGE_LAYOUT_GENERAL,
-                                                        VulkanContext::ImmediateTransitionOptions::signalAt(
-                                                            {target.semaphore.semaphore, vulkan_ready_value}))) {
-                fail_required_interop(std::format("image transition to GENERAL failed: {}", context.lastError()));
-            }
-            target.layout = VK_IMAGE_LAYOUT_GENERAL;
-        }
-
-        assert(target.layout == VK_IMAGE_LAYOUT_GENERAL &&
-               "CUDA surf2Dwrite requires VK_IMAGE_LAYOUT_GENERAL");
-        if (!target.interop.wait(target.timeline_value,
-                                 vulkan_interop_upload_stream_.stream())) {
-            fail_required_interop(std::format("CUDA wait for Vulkan image release failed: {}",
-                                              target.interop.lastError()));
-        }
-        if (!target.interop.copyTensorToSurface(*vulkan_depth_blit_image_,
-                                                vulkan_interop_upload_stream_.stream())) {
-            fail_required_interop(std::format("CUDA copy failed: {}", target.interop.lastError()));
-        }
-        const std::uint64_t signal_value = ++target.timeline_value;
-        if (!target.interop.signal(signal_value, vulkan_interop_upload_stream_.stream())) {
-            fail_required_interop(std::format("CUDA signal failed: {}", target.interop.lastError()));
-        }
-        if (!context.transitionImageLayoutImmediate(target.image.image,
-                                                    VK_IMAGE_LAYOUT_GENERAL,
-                                                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                                    VulkanContext::ImmediateTransitionOptions::waitOn(
-                                                        {target.semaphore.semaphore, signal_value},
-                                                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT))) {
-            fail_required_interop(std::format("Vulkan wait for CUDA signal failed: {}", context.lastError()));
-        }
-        target.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        target.uploaded_source_generation = vulkan_depth_blit_image_generation_;
-        ++target.generation;
-        vulkan_depth_blit_external_image_ = target.image.image;
-        vulkan_depth_blit_external_image_view_ = target.image.view;
-        vulkan_depth_blit_external_image_layout_ = target.layout;
-        vulkan_depth_blit_external_image_generation_ = target.generation;
-    }
-
     VulkanViewportPassParams GuiManager::buildVulkanViewportParams(const VkExtent2D extent,
                                                                    const std::size_t frame_slot) const {
         const bool has_viewport_layout =
@@ -4771,57 +3900,6 @@ namespace lfs::vis::gui {
                                    ? viewport_layout_.size
                                    : glm::vec2(static_cast<float>(extent.width), static_cast<float>(extent.height));
         params.framebuffer_scale = {1.0f, 1.0f};
-
-        params.scene_image = vulkan_scene_image_;
-        params.scene_image_size = vulkan_scene_image_size_;
-        params.scene_image_flip_y = vulkan_scene_image_flip_y_;
-        if (vulkan_external_scene_image_ != VK_NULL_HANDLE &&
-            vulkan_external_scene_image_view_ != VK_NULL_HANDLE &&
-            vulkan_external_scene_image_size_.x > 0 &&
-            vulkan_external_scene_image_size_.y > 0) {
-            params.scene_image_size = vulkan_external_scene_image_size_;
-            params.scene_image_flip_y = vulkan_external_scene_image_flip_y_;
-            params.external_scene_image = vulkan_external_scene_image_;
-            params.external_scene_image_view = vulkan_external_scene_image_view_;
-            params.external_scene_image_layout = vulkan_external_scene_image_layout_;
-            params.external_scene_image_generation = vulkan_external_scene_image_generation_;
-        }
-        const auto bind_cached_interop_slot = [&](const std::size_t slot) -> bool {
-            if (slot >= vulkan_scene_interop_.size()) {
-                return false;
-            }
-            const auto& target = vulkan_scene_interop_[slot];
-            if (!target ||
-                !target->interop.valid() ||
-                target->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ||
-                target->size != params.scene_image_size ||
-                vulkan_scene_image_generation_ == 0 ||
-                target->uploaded_source_generation != vulkan_scene_image_generation_) {
-                return false;
-            }
-
-            params.external_scene_image = target->image.image;
-            params.external_scene_image_view = target->image.view;
-            params.external_scene_image_layout = target->layout;
-            params.external_scene_image_generation = target->generation;
-            return true;
-        };
-        if (params.external_scene_image == VK_NULL_HANDLE) {
-            const bool bound_current_slot = bind_cached_interop_slot(frame_slot);
-            if (!bound_current_slot && export_locked) {
-                // Export mode freezes the viewport and skips new CUDA/Vulkan interop uploads.
-                // Reuse any already-prepared slot so multi-buffered frames keep the same image.
-                for (std::size_t slot = 0; slot < vulkan_scene_interop_.size(); ++slot) {
-                    if (slot != frame_slot && bind_cached_interop_slot(slot)) {
-                        break;
-                    }
-                }
-            }
-            params.preserve_scene_image_binding =
-                params.external_scene_image == VK_NULL_HANDLE &&
-                params.scene_image &&
-                shouldDeferVulkanInteropResize();
-        }
 
         if (auto* const rendering_manager = viewer_ ? viewer_->getRenderingManager() : nullptr) {
             const auto settings = rendering_manager->getSettings();
@@ -4914,24 +3992,11 @@ namespace lfs::vis::gui {
             params.mesh_panels = std::move(mesh_frame.panels);
             params.environment = std::move(mesh_frame.environment);
             params.depth_blit = std::move(mesh_frame.depth_blit);
-            if (vulkan_depth_blit_external_image_view_ != VK_NULL_HANDLE) {
-                params.depth_blit.external_image_view = vulkan_depth_blit_external_image_view_;
-                params.depth_blit.external_image_generation = vulkan_depth_blit_external_image_generation_;
-            }
             params.split_view = std::move(mesh_frame.split_view);
-            // Stitch in CUDA/Vulkan interop views: left reuses the existing scene
-            // interop slot; right has its own parallel slot. When set, the split-view
-            // pass binds these directly and skips the CPU staging upload.
-            if (params.split_view.enabled) {
-                if (params.external_scene_image_view != VK_NULL_HANDLE) {
-                    params.split_view.left.external_image_view = params.external_scene_image_view;
-                    params.split_view.left.external_image_generation = params.external_scene_image_generation;
-                }
-                if (vulkan_split_right_external_image_view_ != VK_NULL_HANDLE) {
-                    params.split_view.right.external_image_view = vulkan_split_right_external_image_view_;
-                    params.split_view.right.external_image_generation = vulkan_split_right_external_image_generation_;
-                }
-            }
+            // Late bind: interop-owned scene / depth-blit / split-view fields. Must
+            // run after params.split_view is populated (split stitching is gated on
+            // params.split_view.enabled).
+            rendering_manager->bindViewportInteropParams(params, frame_slot, export_locked);
         }
 
         // Sample mouse pos with SDL_GetGlobalMouseState here, after all panel/tool overlay
@@ -5791,8 +4856,7 @@ namespace lfs::vis::gui {
             rp_layout.splitter_h = splitter_h;
             right_panel_was_dirty = rml_right_panel_.needsAnimationFrame();
             const float right_panel_edge_grab_w =
-                std::max(PanelLayoutManager::SPLITTER_H * current_ui_scale_,
-                         8.0f * current_ui_scale_);
+                PanelLayoutManager::RIGHT_PANEL_RESIZE_EDGE_HALF_WIDTH * current_ui_scale_;
             const bool pointer_over_right_panel =
                 pointInRect(panel_input.mouse_x, panel_input.mouse_y,
                             rp_layout.pos, rp_layout.size);
@@ -5801,6 +4865,15 @@ namespace lfs::vis::gui {
                 panel_input.mouse_x <= rp_layout.pos.x + right_panel_edge_grab_w &&
                 panel_input.mouse_y >= rp_layout.pos.y &&
                 panel_input.mouse_y < rp_layout.pos.y + rp_layout.size.y;
+            const bool float_blocks_rp = has_floating_panels &&
+                                         reg.isPositionOverFloatingPanel(panel_input.mouse_x, panel_input.mouse_y);
+            // Keep a viewport drag captured by the viewport when it crosses
+            // the resize edge, rather than starting panel hover or resize UI.
+            const bool viewport_pointer_captured =
+                hasMouseButtonDown(sdl_input) && window_manager &&
+                window_manager->inputRouter().state().pointer_capture == input::InputTarget::Viewport;
+            right_panel_resize_edge_was_hovered_ = !float_blocks_rp && !viewport_pointer_captured &&
+                                                   pointer_over_right_panel_edge;
             constexpr float RIGHT_PANEL_PAD = 8.0f;
             const float content_x = rp_layout.pos.x + RIGHT_PANEL_PAD;
             const float content_top = screen.work_pos.y + RIGHT_PANEL_PAD;
@@ -5818,9 +4891,7 @@ namespace lfs::vis::gui {
                             glm::vec2{content_x, tab_content_y},
                             glm::vec2{content_w, tab_content_h});
 
-            const bool float_blocks_rp = has_floating_panels &&
-                                         reg.isPositionOverFloatingPanel(panel_input.mouse_x, panel_input.mouse_y);
-            if (float_blocks_rp) {
+            if (float_blocks_rp || viewport_pointer_captured) {
                 PanelInputState masked_input = panel_input;
                 masked_input.mouse_x = -1.0e9f;
                 masked_input.mouse_y = -1.0e9f;
@@ -5836,7 +4907,7 @@ namespace lfs::vis::gui {
                 rml_right_panel_.processInput(rp_layout, panel_input);
             }
 
-            if (rml_right_panel_.wantsInput() && !float_blocks_rp)
+            if (rml_right_panel_.wantsInput() && !float_blocks_rp && !viewport_pointer_captured)
                 guiFocusState().want_capture_mouse = true;
             if (rml_right_panel_.wantsKeyboard())
                 guiFocusState().want_capture_keyboard = true;
@@ -5856,7 +4927,8 @@ namespace lfs::vis::gui {
             }
 
             const bool pointer_targets_right_panel =
-                !float_blocks_rp && (pointer_over_right_panel || pointer_over_right_panel_edge);
+                !float_blocks_rp && !viewport_pointer_captured &&
+                (pointer_over_right_panel || pointer_over_right_panel_edge);
             right_panel_pointer_targets_panel = pointer_targets_right_panel;
             if (pointer_targets_right_panel &&
                 (hasMouseButtonClicked(sdl_input) || hasMouseButtonDown(sdl_input))) {
@@ -5914,6 +4986,7 @@ namespace lfs::vis::gui {
         } else {
             right_panel_pointer_live_capture_ = false;
             right_panel_pointer_capture_region_ = RightPanelPointerRegion::None;
+            right_panel_resize_edge_was_hovered_ = false;
         }
         if (!hasMouseButtonDown(sdl_input)) {
             right_panel_pointer_live_capture_ = false;
@@ -6450,12 +5523,13 @@ namespace lfs::vis::gui {
             clear_value.color = VkClearColorValue{{bg.x, bg.y, bg.z, 1.0f}};
 
             bool interop_prepare_ok = true;
+            auto* const rendering = viewer_ ? viewer_->getRenderingManager() : nullptr;
             if (vulkan_context && !isViewportExportLocked()) {
                 LOG_TIMER_THRESHOLD("gui_render.prepareVulkanSceneInterop", 0.25);
                 try {
-                    prepareVulkanSceneInterop(*vulkan_context);
-                    prepareVulkanSplitRightInterop(*vulkan_context);
-                    prepareVulkanDepthBlitInterop(*vulkan_context);
+                    if (rendering) {
+                        rendering->prepareViewportInterop(*vulkan_context);
+                    }
                 } catch (const std::exception& error) {
                     interop_prepare_ok = false;
                     LOG_ERROR("Skipping Vulkan GUI frame after CUDA/Vulkan interop failure: {}",
@@ -6475,15 +5549,17 @@ namespace lfs::vis::gui {
                            vulkan_context->beginFrame(clear_value, frame);
             }
             if (begin_ok) {
-                if (vulkan_frame_completion_semaphore_ != VK_NULL_HANDLE &&
-                    vulkan_frame_completion_value_ != 0) {
-                    LOG_TIMER_THRESHOLD("gui_render.vksplat_completion_wait_submit", 0.25);
-                    // VkSplat color/split/depth outputs are first consumed only by
-                    // fragment sampling in the viewport pass graph. Earlier graphics
-                    // work can proceed while the async compute submission finishes.
-                    vulkan_context->addFrameTimelineWait(vulkan_frame_completion_semaphore_,
-                                                         vulkan_frame_completion_value_,
-                                                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+                if (rendering) {
+                    const auto completion = rendering->viewportInterop().frameCompletion();
+                    if (completion.semaphore != VK_NULL_HANDLE && completion.value != 0) {
+                        LOG_TIMER_THRESHOLD("gui_render.vksplat_completion_wait_submit", 0.25);
+                        // VkSplat color/split/depth outputs are first consumed only by
+                        // fragment sampling in the viewport pass graph. Earlier graphics
+                        // work can proceed while the async compute submission finishes.
+                        vulkan_context->addFrameTimelineWait(completion.semaphore,
+                                                             completion.value,
+                                                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+                    }
                 }
                 VulkanViewportPassParams viewport_params{};
                 {
@@ -6990,6 +6066,21 @@ namespace lfs::vis::gui {
         return PanelRegistry::instance().isPositionOverFloatingPanel(x, y);
     }
 
+    bool GuiManager::isPositionOverRightPanelResizeEdge(const double x, const double y) const {
+        if (!show_main_panel_ || ui_hidden_ ||
+            last_ui_layout_work_size_.x <= 0.0f || last_ui_layout_work_size_.y <= 0.0f) {
+            return false;
+        }
+
+        const float panel_x = last_ui_layout_work_pos_.x + last_ui_layout_work_size_.x -
+                              panel_layout_.getRightPanelWidth();
+        const float strip_half_w =
+            PanelLayoutManager::RIGHT_PANEL_RESIZE_EDGE_HALF_WIDTH * current_ui_scale_;
+        return x >= panel_x - strip_half_w && x <= panel_x + strip_half_w &&
+               y >= last_ui_layout_work_pos_.y &&
+               y < last_ui_layout_work_pos_.y + last_ui_layout_work_size_.y;
+    }
+
     GuiHitTestResult GuiManager::hitTestPointer(const double x, const double y) const {
         if (isCapturingInput() || isModalWindowOpen() || startup_overlay_.blocksUnderlayInput() ||
             (global_context_menu_ && global_context_menu_->isOpen())) {
@@ -7016,6 +6107,11 @@ namespace lfs::vis::gui {
         if (sequencer_ui_.blocksPointer(x, y) || rml_viewport_overlay_.blocksPointer(x, y)) {
             return {.blocks_pointer = true, .takes_keyboard_focus = true};
         }
+
+        // Match the resize edge geometry used by the panel before routing a
+        // press, without treating hover or wheel input as panel interaction.
+        if (isPositionOverRightPanelResizeEdge(x, y))
+            return {.blocks_mouse_button = true};
 
         return {};
     }
@@ -7260,6 +6356,13 @@ namespace lfs::vis::gui {
 
         const bool ui_popup_open = global_context_menu_ && global_context_menu_->isOpen();
         if (isCapturingInput() || ui_popup_open || startup_overlay_.blocksUnderlayInput() || drag_drop_hovering_) {
+            return true;
+        }
+
+        // Wake a frame while the pointer is over the resize edge so the panel
+        // can update its cursor request even while the GUI is otherwise idle.
+        if (right_panel_resize_edge_was_hovered_ ||
+            isPositionOverRightPanelResizeEdge(mouse_x, mouse_y)) {
             return true;
         }
 

@@ -157,6 +157,7 @@ set(TEST_FILES
     test_tcp_publisher.cpp
     test_view_info_json.cpp
     test_video_export_utils.cpp
+    test_video_frame_extractor_naming.cpp
     test_video_hdr_logic.cpp
     test_visualizer_post_work.cpp
     test_panel_registry_animation_demand.cpp
@@ -197,6 +198,7 @@ set(TEST_FILES
     test_input_controller_focus.cpp
     test_input_controller_dataset_load.cpp
     test_selection_service_interactions.cpp
+    test_scene_graph_identity.cpp
     test_undo_history.cpp
     test_selection_command_dispatch.cpp
     test_selection_operator_modal.cpp
@@ -224,6 +226,7 @@ set(TEST_FILES
     test_export_env_composite.cpp
     test_undistort.cpp
     test_viewport_region_utils.cpp
+    test_viewport_interop_decision.cpp
     test_mesh_data.cpp
     test_openmesh_bridge.cpp
     test_mesh_loader.cpp
